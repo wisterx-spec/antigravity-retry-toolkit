@@ -207,6 +207,11 @@ This repo also includes a prebuilt distribution zip:
 
 - [MIT](LICENSE)
 
+## Support
+
+- If this toolkit saves you time, you can support ongoing maintenance through [GitHub Sponsors](https://github.com/sponsors/wisterx-spec)
+- A `Buy Me a Coffee` link can be added later once a public support URL is available
+
 ## CI
 
 - [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs shell syntax checks, JavaScript syntax checks, and VSIX packaging on GitHub Actions
