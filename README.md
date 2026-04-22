@@ -9,6 +9,16 @@ Antigravity Retry Toolkit adds two capabilities to Antigravity:
 
 This repository is organized so it can be pushed to GitHub directly.
 
+## Common failure symptoms
+
+This toolkit is meant for Antigravity users who repeatedly hit problems like:
+
+- `Agent terminated due to error`
+- `429 rate limiting`
+- `503 server overload`
+- connection failures or transient transport errors
+- repeated manual retries with no clear visibility into what is happening
+
 ## Why this exists
 
 In the default Antigravity experience, transient upstream failures are painful to work with:
