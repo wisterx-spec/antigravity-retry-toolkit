@@ -1,46 +1,52 @@
 # Antigravity Retry Toolkit
 
+A small macOS toolkit for Antigravity users who want transient model/backend failures to retry automatically and become visible instead of failing silently.
+
 Antigravity Retry Toolkit adds two capabilities to Antigravity:
 
 - automatic retry for transient cloud capacity failures
-- a status bar extension that shows retry state, recent errors, and hard quota issues
+- a status bar extension that shows retry state, recent errors, and quota failures
 
 This repository is organized so it can be pushed to GitHub directly.
+
+## Why this exists
+
+In the default Antigravity experience, transient upstream failures are painful to work with:
+
+- the agent can stop on a temporary `503` or capacity error
+- retrying by hand is repetitive and easy to lose track of
+- there is no clear built-in view of which attempt is running, what model failed, or whether the request recovered
+
+This toolkit fixes that by adding a local retry proxy and a lightweight status bar view inside Antigravity.
+
+## What you get
+
+- automatic retry for temporary upstream failures such as `503`, transport errors, and retryable `429`
+- immediate pass-through for hard quota exhaustion, so real quota errors are still visible
+- live retry status in Antigravity: attempt count, current error, model, endpoint, and recent retry history
+- per-conversation status isolation, so one window does not leak retry state into another
+- local development scripts for packaging, installing, verifying, and reloading the extension
 
 ## Status
 
 - Current version: `0.2.17`
 - Platform target: macOS
 - Retry proxy status: verified locally
-- Multi-window conversation scoping: verified locally
+- Multi-window per-conversation status isolation: verified locally
 - Automatic extension reload after external VSIX install: verified locally
 
 ## Screenshots
 
-The status bar extension shows live retry state, cascade scoping, model name, and recent retry events directly inside Antigravity.
-<img width="452" height="258" alt="image" src="https://github.com/user-attachments/assets/6ffd520a-5710-4b3a-88dc-db533da0471a" />
+Before: Antigravity can stop on a transient upstream error and leave you with a manual retry loop.
+
+<img width="452" height="258" alt="Antigravity transient error example" src="https://github.com/user-attachments/assets/6ffd520a-5710-4b3a-88dc-db533da0471a" />
+
+After: the extension shows live retry state, conversation ID, model name, and recent retry events directly inside Antigravity.
+
+<img width="1033" height="400" alt="Retry status tooltip and status bar" src="https://github.com/user-attachments/assets/b51d8ecc-125f-48c0-8699-c7bb0d5e2f22" />
 
 
-<img width="1033" height="400" alt="image" src="https://github.com/user-attachments/assets/b51d8ecc-125f-48c0-8699-c7bb0d5e2f22" />
-
-
-
-## License
-
-- [MIT](LICENSE)
-
-## Repository layout
-
-- `proxy/`
-  Local retry proxy source
-- `scripts/`
-  Install and uninstall scripts for the proxy launch agent
-- `extension/`
-  VS Code / Antigravity status bar extension source and packaged VSIX
-- `dist/`
-  Prebuilt release archive
-
-## Components
+## How it works
 
 ### Retry proxy
 
@@ -52,9 +58,7 @@ Behavior:
 
 - retries `503`, transient `429`, and transport failures
 - passes through hard quota exhaustion immediately
-- exposes:
-  - `__health`
-  - `__status`
+- exposes `__health` and `__status`
 - stores recent retry events in memory for the status bar extension
 
 ### Status bar extension
@@ -74,11 +78,11 @@ Behavior:
 - shows hard quota failures as `Quota Exceeded`
 - shows `Recovered` after a successful retry cycle
 - can show `0` while idle
-- exposes recent events in tooltip and output channel
+- shows recent events in the tooltip and output channel
 
 ## Quick start
 
-### 1. Install the proxy
+### 1. Install the local retry proxy
 
 ```bash
 cd scripts
@@ -86,7 +90,7 @@ chmod +x install-proxy.sh uninstall-proxy.sh
 ./install-proxy.sh
 ```
 
-### 2. Point Antigravity to the local proxy
+### 2. Point Antigravity at the local proxy
 
 Add this to Antigravity user settings:
 
@@ -96,6 +100,8 @@ Add this to Antigravity user settings:
 }
 ```
 
+`jetski.cloudCodeUrl` is the Antigravity setting that controls which backend URL the app uses for cloud code requests. Here, it is redirected to the local retry proxy.
+
 ### 3. Install the status bar extension
 
 Inside Antigravity:
@@ -103,6 +109,17 @@ Inside Antigravity:
 1. Run `Extensions: Install from VSIX...`
 2. Choose `extension/retry-status-bar-0.2.17.vsix`
 3. Run `Developer: Reload Window`
+
+## Repository layout
+
+- `proxy/`
+  Local retry proxy source
+- `scripts/`
+  Install, uninstall, packaging, reload, and verification scripts
+- `extension/`
+  Antigravity / VS Code status bar extension source and packaged VSIX
+- `dist/`
+  Prebuilt release archive
 
 ## Local development loop
 
@@ -143,7 +160,7 @@ RETRY_TOOLKIT_WINDOW_RELOAD_TIMEOUT_SECONDS=5 ./scripts/verify-dev-loop.sh --rel
 
 Current limitation:
 
-- `scripts/reload-antigravity-windows.sh` is best-effort. On some Antigravity builds, macOS accessibility automation can hang while switching windows, so `verify-dev-loop.sh --reload-windows` can still fail even though the in-extension auto-reload path works
+- `scripts/reload-antigravity-windows.sh` only tries to reload open Antigravity windows through macOS accessibility automation. On some Antigravity builds, window switching can hang, so `verify-dev-loop.sh --reload-windows` can still fail even though the in-extension auto-reload path works
 
 Auto reload note:
 
@@ -174,6 +191,10 @@ Set `ANTIGRAVITY_PROXY_DEBUG_REQUEST_IDENTIFIERS=1` to log candidate request ide
 This repo also includes a prebuilt distribution zip:
 
 - [dist/antigravity-retry-toolkit.zip](dist/antigravity-retry-toolkit.zip)
+
+## License
+
+- [MIT](LICENSE)
 
 ## CI
 
