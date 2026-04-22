@@ -18,8 +18,12 @@ This repository is organized so it can be pushed to GitHub directly.
 ## Screenshots
 
 The status bar extension shows live retry state, cascade scoping, model name, and recent retry events directly inside Antigravity.
+<img width="452" height="258" alt="image" src="https://github.com/user-attachments/assets/6ffd520a-5710-4b3a-88dc-db533da0471a" />
 
-![Retry status tooltip and status bar](docs/screenshots/retry-status.png)
+
+<img width="1033" height="400" alt="image" src="https://github.com/user-attachments/assets/b51d8ecc-125f-48c0-8699-c7bb0d5e2f22" />
+
+
 
 ## License
 
