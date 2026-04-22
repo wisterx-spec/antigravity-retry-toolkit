@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate shell scripts
+        run: |
+          zsh -n scripts/dev-loop.sh
+          zsh -n scripts/install-extension.sh
+          zsh -n scripts/install-proxy.sh
+          zsh -n scripts/reload-antigravity-windows.sh
+          zsh -n scripts/uninstall-proxy.sh
+          zsh -n scripts/verify-dev-loop.sh
+
+      - name: Validate JavaScript syntax
+        run: |
+          node --check proxy/antigravity-cloudcode-proxy.js
+          node --check extension/extension.js
+
+      - name: Package VSIX
+        run: |
+          cd extension
+          npx @vscode/vsce package --allow-missing-repository
