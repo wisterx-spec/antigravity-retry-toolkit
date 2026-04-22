@@ -35,6 +35,16 @@ This toolkit fixes that by adding a local retry proxy and a lightweight status b
 - Multi-window per-conversation status isolation: verified locally
 - Automatic extension reload after external VSIX install: verified locally
 
+## Known limits and unverified risks
+
+- Verified on local macOS setups only. This repository has not been validated on Windows or Linux.
+- Verified against real transient `503` and quota-style `429` flows locally, but not against a broad matrix of upstream failure modes or long-running production traffic.
+- Multi-window conversation isolation has been verified locally, but not stress-tested under sustained high parallel request load.
+- The proxy currently has no separate max-concurrency control. Very high local parallelism may still increase upstream throttling rather than improve recovery.
+- Retry status lives in memory. If the proxy process restarts, in-flight retry history and current UI state are lost.
+- The setup depends on Antigravity internals such as `jetski.cloudCodeUrl`, local extension installation behavior, and current window/context signals. Future Antigravity builds could change those integration points.
+- Automatic window reload after external VSIX install has been verified locally, but there is no full headless end-to-end UI test suite yet.
+
 ## Screenshots
 
 Before: Antigravity can stop on a transient upstream error and leave you with a manual retry loop.
