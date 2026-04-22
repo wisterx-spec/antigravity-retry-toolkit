@@ -26,6 +26,7 @@ This toolkit fixes that by adding a local retry proxy and a lightweight status b
 - live retry status in Antigravity: attempt count, current error, model, endpoint, and recent retry history
 - per-conversation status isolation, so one window does not leak retry state into another
 - local development scripts for packaging, installing, verifying, and reloading the extension
+- a non-invasive integration model: this project does not modify files inside `Antigravity.app`; it works through a local proxy, user-level settings, and a separately installed extension
 
 ## Status
 
