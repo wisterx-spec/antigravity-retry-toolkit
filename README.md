@@ -15,6 +15,12 @@ This repository is organized so it can be pushed to GitHub directly.
 - Multi-window conversation scoping: verified locally
 - Automatic extension reload after external VSIX install: verified locally
 
+## Screenshots
+
+The status bar extension shows live retry state, cascade scoping, model name, and recent retry events directly inside Antigravity.
+
+![Retry status tooltip and status bar](docs/screenshots/retry-status.png)
+
 ## License
 
 - [MIT](LICENSE)
