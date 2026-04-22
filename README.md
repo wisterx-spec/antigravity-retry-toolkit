@@ -24,7 +24,7 @@ This toolkit fixes that by adding a local retry proxy and a lightweight status b
 - automatic retry for temporary upstream failures such as `503`, transport errors, and retryable `429`
 - immediate pass-through for hard quota exhaustion, so real quota errors are still visible
 - live retry status in Antigravity: attempt count, current error, model, endpoint, and recent retry history
-- per-conversation status isolation, so one window does not leak retry state into another
+- multi-window, multi-conversation status isolation, so one window does not leak retry state into another
 - local development scripts for packaging, installing, verifying, and reloading the extension
 - a non-invasive integration model: this project does not modify files inside `Antigravity.app`; it works through a local proxy, user-level settings, and a separately installed extension
 
@@ -33,14 +33,15 @@ This toolkit fixes that by adding a local retry proxy and a lightweight status b
 - Current version: `0.2.17`
 - Platform target: macOS
 - Retry proxy status: verified locally
-- Multi-window per-conversation status isolation: verified locally
+- Multi-window, multi-conversation status isolation: verified locally
+- Real retry flows verified across separate conversations, including transient `503` retries and quota-style `429` handling
 - Automatic extension reload after external VSIX install: verified locally
 
 ## Known limits and unverified risks
 
 - Verified on local macOS setups only. This repository has not been validated on Windows or Linux.
 - Verified against real transient `503` and quota-style `429` flows locally, but not against a broad matrix of upstream failure modes or long-running production traffic.
-- Multi-window conversation isolation has been verified locally, but not stress-tested under sustained high parallel request load.
+- Multi-window, multi-conversation isolation has been verified locally, but not stress-tested under sustained high parallel request load.
 - The proxy currently has no separate max-concurrency control. Very high local parallelism may still increase upstream throttling rather than improve recovery.
 - Retry status lives in memory. If the proxy process restarts, in-flight retry history and current UI state are lost.
 - The setup depends on Antigravity internals such as `jetski.cloudCodeUrl`, local extension installation behavior, and current window/context signals. Future Antigravity builds could change those integration points.
