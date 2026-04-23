@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.18
+
+- Add a manual stop command for the current conversation retry
+- Add a proxy stop endpoint and tooltip action for stopping an active retry loop
+
 ## 0.2.17
 
 - Validate that open Antigravity windows auto-reload after an external VSIX install once the watcher is bootstrapped

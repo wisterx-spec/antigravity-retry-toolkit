@@ -237,6 +237,7 @@ class RetryStatusBarController {
     context.subscriptions.push(
       vscode.commands.registerCommand("retryStatusBar.showLog", () => this.output.show(true)),
       vscode.commands.registerCommand("retryStatusBar.refresh", () => this.refreshNow()),
+      vscode.commands.registerCommand("retryStatusBar.stopCurrentRetry", () => this.stopCurrentRetry()),
       vscode.commands.registerCommand("retryStatusBar.dumpAntigravityContext", () => this.dumpAntigravityContext()),
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (event.affectsConfiguration("retryStatusBar")) {
@@ -288,6 +289,7 @@ class RetryStatusBarController {
     const config = vscode.workspace.getConfiguration("retryStatusBar");
     return {
       statusUrl: config.get("statusUrl", "http://127.0.0.1:38475/__status"),
+      stopUrl: config.get("stopUrl", "http://127.0.0.1:38475/__stop"),
       pollIntervalMs: config.get("pollIntervalMs", 1000),
       showWhenIdle: config.get("showWhenIdle", true),
       idleText: config.get("idleText", "0"),
@@ -397,6 +399,63 @@ class RetryStatusBarController {
     });
   }
 
+  postJson(urlString, payload) {
+    return new Promise((resolve, reject) => {
+      let url;
+      try {
+        url = new URL(urlString);
+      } catch {
+        reject(new Error(`Invalid retry control URL: ${urlString}`));
+        return;
+      }
+
+      const body = Buffer.from(JSON.stringify(payload));
+      const client = url.protocol === "https:" ? https : http;
+      const req = client.request(
+        url,
+        {
+          method: "POST",
+          timeout: 1500,
+          headers: {
+            "content-type": "application/json",
+            "content-length": String(body.length),
+            "cache-control": "no-cache",
+          },
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+          res.on("end", () => {
+            const responseText = Buffer.concat(chunks).toString("utf8");
+            let parsed = {};
+            if (responseText) {
+              try {
+                parsed = JSON.parse(responseText);
+              } catch {
+                reject(new Error(`Invalid JSON from control endpoint: ${responseText}`));
+                return;
+              }
+            }
+
+            if ((res.statusCode || 0) >= 400) {
+              reject(new Error(parsed?.message || `Retry control failed: HTTP ${res.statusCode}`));
+              return;
+            }
+
+            resolve(parsed);
+          });
+        },
+      );
+
+      req.on("timeout", () => {
+        req.destroy(new Error("Retry control timeout"));
+      });
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
+  }
+
   consumeEvents(events) {
     for (const event of events) {
       if (!event || typeof event.id !== "number" || event.id <= this.lastEventId) {
@@ -404,6 +463,24 @@ class RetryStatusBarController {
       }
       this.lastEventId = event.id;
       this.output.appendLine(formatEventLine(event));
+    }
+  }
+
+  async stopCurrentRetry() {
+    if (!this.activeCascadeId) {
+      vscode.window.showWarningMessage("Retry Status Bar: there is no active conversation retry to stop.");
+      return;
+    }
+
+    try {
+      await this.postJson(this.getConfig().stopUrl, { cascadeId: this.activeCascadeId });
+      this.output.appendLine(`[diag] Manual stop requested for cascade ${this.activeCascadeId}`);
+      await this.refreshNow();
+      vscode.window.showInformationMessage(`Retry Status Bar: stopped retry for ${this.activeCascadeId}`);
+    } catch (error) {
+      const message = typeof error?.message === "string" ? error.message : String(error);
+      this.output.appendLine(`[diag] Manual stop failed for ${this.activeCascadeId}: ${message}`);
+      vscode.window.showErrorMessage(`Retry Status Bar: ${message}`);
     }
   }
 
@@ -563,6 +640,13 @@ class RetryStatusBarController {
       return;
     }
 
+    if (label === "Stopped") {
+      this.statusBar.text = "$(circle-slash) Stopped";
+      this.statusBar.tooltip = this.buildTooltip(status, events, "The current conversation retry was stopped manually.");
+      this.statusBar.show();
+      return;
+    }
+
     if (label === "Retry Failed") {
       this.statusBar.text = "$(error) Retry Failed";
       this.statusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
@@ -601,7 +685,11 @@ class RetryStatusBarController {
         md.appendMarkdown(`- ${formatEventLine(event)}\n`);
       }
     }
-    md.appendMarkdown(`\n[Open log](command:retryStatusBar.showLog)`);
+    md.appendMarkdown(`\n`);
+    if (status.active && (status.scopeCascadeId || status.cascadeId)) {
+      md.appendMarkdown(`[Stop retry](command:retryStatusBar.stopCurrentRetry) · `);
+    }
+    md.appendMarkdown(`[Open log](command:retryStatusBar.showLog)`);
     return md;
   }
 

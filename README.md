@@ -33,14 +33,14 @@ This toolkit fixes that by adding a local retry proxy and a lightweight status b
 
 - automatic retry for temporary upstream failures such as `503`, transport errors, and retryable `429`
 - immediate pass-through for hard quota exhaustion, so real quota errors are still visible
-- live retry status in Antigravity: attempt count, current error, model, endpoint, and recent retry history
+- live retry status in Antigravity: attempt count, current error, model, endpoint, recent retry history, and a manual stop action
 - multi-window, multi-conversation status isolation, so one window does not leak retry state into another
 - local development scripts for packaging, installing, verifying, and reloading the extension
 - a non-invasive integration model: this project does not modify files inside `Antigravity.app`; it works through a local proxy, user-level settings, and a separately installed extension
 
 ## Status
 
-- Current version: `0.2.17`
+- Current version: `0.2.18`
 - Platform target: macOS
 - Retry proxy status: verified locally
 - Multi-window, multi-conversation status isolation: verified locally
@@ -92,7 +92,7 @@ Source:
 
 Packaged VSIX:
 
-- [extension/retry-status-bar-0.2.17.vsix](extension/retry-status-bar-0.2.17.vsix)
+- [extension/retry-status-bar-0.2.18.vsix](extension/retry-status-bar-0.2.18.vsix)
 
 Behavior:
 
@@ -101,6 +101,7 @@ Behavior:
 - shows `Recovered` after a successful retry cycle
 - can show `0` while idle
 - shows recent events in the tooltip and output channel
+- lets you stop the current conversation retry manually from the tooltip or command palette
 
 ## Quick start
 
@@ -129,8 +130,17 @@ Add this to Antigravity user settings:
 Inside Antigravity:
 
 1. Run `Extensions: Install from VSIX...`
-2. Choose `extension/retry-status-bar-0.2.17.vsix`
+2. Choose `extension/retry-status-bar-0.2.18.vsix`
 3. Run `Developer: Reload Window`
+
+### 4. Stop a retry manually
+
+If you want to stop the retry loop for the current conversation:
+
+1. Run `Retry Status Bar: Stop Current Retry` from the command palette
+2. Or click `Stop retry` in the status tooltip while a retry is active
+
+This stops the local retry loop for the active conversation. It does not patch or modify `Antigravity.app`.
 
 ## Repository layout
 
@@ -165,7 +175,7 @@ What it does:
 If you only want to install a prebuilt VSIX without packaging again:
 
 ```bash
-./scripts/install-extension.sh extension/retry-status-bar-0.2.17.vsix
+./scripts/install-extension.sh extension/retry-status-bar-0.2.18.vsix
 ```
 
 If you want a pass/fail verification report and automatic Antigravity window reload:

@@ -41,6 +41,15 @@ const runtimeStatus = {
 
 const cascadeStatuses = new Map();
 const cascadeClearTimers = new Map();
+const activeRequestControls = new Map();
+
+class RetryStoppedError extends Error {
+  constructor(message = "Retry stopped by user") {
+    super(message);
+    this.name = "RetryStoppedError";
+    this.code = "RETRY_STOPPED";
+  }
+}
 
 function log(message) {
   const now = new Date().toISOString();
@@ -49,6 +58,32 @@ function log(message) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryStoppedError(error) {
+  return error instanceof RetryStoppedError || error?.code === "RETRY_STOPPED";
+}
+
+function requestStop(control, error = new RetryStoppedError()) {
+  if (!control || control.stopped) {
+    return false;
+  }
+
+  control.stopped = true;
+
+  if (control.currentUpstreamRes && typeof control.currentUpstreamRes.destroy === "function") {
+    control.currentUpstreamRes.destroy(error);
+  }
+
+  if (control.currentUpstreamReq && typeof control.currentUpstreamReq.destroy === "function") {
+    control.currentUpstreamReq.destroy(error);
+  }
+
+  for (const listener of [...control.stopListeners]) {
+    listener();
+  }
+
+  return true;
 }
 
 function cloneStatusSnapshot(status) {
@@ -165,6 +200,43 @@ function scheduleRuntimeClear(cascadeId, expectedPath, expectedLabel, expectedMe
       clearRuntimeStatus();
     }
   }, delayMs);
+}
+
+function markStopped(requestInfo, attempt = 0) {
+  const next = {
+    active: false,
+    label: "Stopped",
+    attempt: 0,
+    path: requestInfo.path,
+    model: requestInfo.model,
+    cascadeId: requestInfo.cascadeId,
+    statusCode: 499,
+    message: "Stopped by user",
+  };
+  setRuntimeStatus(next);
+  setCascadeStatus(requestInfo.cascadeId, next);
+  pushEvent({
+    type: "stopped",
+    path: requestInfo.path,
+    model: requestInfo.model,
+    cascadeId: requestInfo.cascadeId,
+    attempt,
+    statusCode: 499,
+    message: "Stopped by user",
+  });
+  scheduleRuntimeClear(requestInfo.cascadeId, requestInfo.path, "Stopped", "Stopped by user", statusHoldMs);
+  scheduleCascadeClear(requestInfo.cascadeId, requestInfo.path, "Stopped", "Stopped by user", statusHoldMs);
+}
+
+function markStoppedOnce(control, requestInfo, attempt = 0) {
+  if (control?.stopRecorded) {
+    return false;
+  }
+  if (control) {
+    control.stopRecorded = true;
+  }
+  markStopped(requestInfo, attempt);
+  return true;
 }
 
 function beginRetryStatus(requestInfo, attempt, statusCode, message) {
@@ -416,6 +488,55 @@ function extractRequestInfo(req, body) {
   return info;
 }
 
+function assertNotStopped(control) {
+  if (control?.stopped) {
+    throw new RetryStoppedError();
+  }
+}
+
+function waitForDelayOrStop(control, delayMs) {
+  if (!control) {
+    return sleep(delayMs);
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, delayMs);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (control.stopListeners) {
+        control.stopListeners.delete(onStop);
+      }
+    };
+
+    const onStop = () => {
+      cleanup();
+      reject(new RetryStoppedError());
+    };
+
+    control.stopListeners.add(onStop);
+    if (control.stopped) {
+      onStop();
+    }
+  });
+}
+
+async function waitForRetryDelay(requestInfo, control, attempt, delay) {
+  try {
+    await waitForDelayOrStop(control, delay);
+  } catch (error) {
+    if (isRetryStoppedError(error)) {
+      if (markStoppedOnce(control, requestInfo, attempt)) {
+        log(`retry stopped attempt=${attempt}/${maxAttempts}${formatRequestContext(requestInfo)}`);
+      }
+    }
+    throw error;
+  }
+}
+
 function formatRequestContext(requestInfo) {
   const parts = [` path=${requestInfo.path}`];
   if (requestInfo.model) {
@@ -434,7 +555,7 @@ function formatRequestContext(requestInfo) {
   return parts.join("");
 }
 
-function singleForwardRequest(req, body) {
+function singleForwardRequest(req, body, control) {
   return new Promise((resolve, reject) => {
     const headers = { ...req.headers, host: targetHost };
     if (body.length > 0) {
@@ -452,10 +573,26 @@ function singleForwardRequest(req, body) {
         path: req.url,
         headers,
       },
-      (upstreamRes) => resolve({ upstreamRes }),
+      (upstreamRes) => {
+        if (control) {
+          control.currentUpstreamReq = undefined;
+          control.currentUpstreamRes = upstreamRes;
+        }
+        resolve({ upstreamRes });
+      },
     );
 
-    upstreamReq.on("error", reject);
+    if (control) {
+      control.currentUpstreamReq = upstreamReq;
+    }
+
+    upstreamReq.on("error", (error) => {
+      if (control) {
+        control.currentUpstreamReq = undefined;
+        control.currentUpstreamRes = undefined;
+      }
+      reject(error);
+    });
 
     if (body.length > 0) {
       upstreamReq.write(body);
@@ -465,44 +602,95 @@ function singleForwardRequest(req, body) {
 }
 
 async function forwardRequest(req, body, requestInfo) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      const { upstreamRes } = await singleForwardRequest(req, body);
-      const statusCode = upstreamRes.statusCode || 0;
-      if (!retryableStatuses.has(statusCode)) {
-        return { upstreamRes };
+  const control = requestInfo.cascadeId
+    ? {
+        requestInfo,
+        stopped: false,
+        stopListeners: new Set(),
       }
+    : undefined;
 
-      const responseBody = await readResponseBody(upstreamRes);
-      const bodyText = responseBody.toString("utf8");
-
-      if (isQuotaExhausted(statusCode, bodyText)) {
-        showQuotaExhausted(requestInfo);
-        log(`passthrough quota exhaustion status=${statusCode} attempt=${attempt}/${maxAttempts}${formatRequestContext(requestInfo)}`);
-        return { upstreamRes, responseBody };
-      }
-
-      if (attempt >= maxAttempts) {
-        return { upstreamRes, responseBody };
-      }
-
-      const delay = retryDelayMs(attempt, upstreamRes.headers, bodyText);
-      beginRetryStatus(requestInfo, attempt, statusCode, `HTTP ${statusCode}`);
-      log(`retryable upstream status=${statusCode} attempt=${attempt}/${maxAttempts} delay_ms=${delay}${formatRequestContext(requestInfo)}`);
-      await sleep(delay);
-    } catch (error) {
-      if (attempt >= maxAttempts) {
-        throw error;
-      }
-
-      const delay = Math.min(baseDelayMs * Math.pow(2, Math.max(0, attempt - 1)), maxDelayMs);
-      beginRetryStatus(requestInfo, attempt, 0, error.message);
-      log(`upstream error attempt=${attempt}/${maxAttempts} delay_ms=${delay}${formatRequestContext(requestInfo)} error=${error.message}`);
-      await sleep(delay);
-    }
+  if (control) {
+    activeRequestControls.set(requestInfo.cascadeId, control);
   }
 
-  throw new Error("retry loop exited unexpectedly");
+  try {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        assertNotStopped(control);
+        const { upstreamRes } = await singleForwardRequest(req, body, control);
+        assertNotStopped(control);
+
+        const statusCode = upstreamRes.statusCode || 0;
+        if (!retryableStatuses.has(statusCode)) {
+          return { upstreamRes };
+        }
+
+        const responseBody = await readResponseBody(upstreamRes);
+        if (control) {
+          control.currentUpstreamRes = undefined;
+        }
+        assertNotStopped(control);
+        const bodyText = responseBody.toString("utf8");
+
+        if (isQuotaExhausted(statusCode, bodyText)) {
+          showQuotaExhausted(requestInfo);
+          log(`passthrough quota exhaustion status=${statusCode} attempt=${attempt}/${maxAttempts}${formatRequestContext(requestInfo)}`);
+          return { upstreamRes, responseBody };
+        }
+
+        if (attempt >= maxAttempts) {
+          return { upstreamRes, responseBody };
+        }
+
+        const delay = retryDelayMs(attempt, upstreamRes.headers, bodyText);
+        beginRetryStatus(requestInfo, attempt, statusCode, `HTTP ${statusCode}`);
+        log(`retryable upstream status=${statusCode} attempt=${attempt}/${maxAttempts} delay_ms=${delay}${formatRequestContext(requestInfo)}`);
+        await waitForRetryDelay(requestInfo, control, attempt, delay);
+      } catch (error) {
+        if (isRetryStoppedError(error)) {
+          if (markStoppedOnce(control, requestInfo, attempt)) {
+            log(`retry stopped attempt=${attempt}/${maxAttempts}${formatRequestContext(requestInfo)}`);
+          }
+          throw error;
+        }
+
+        if (attempt >= maxAttempts) {
+          throw error;
+        }
+
+        const delay = Math.min(baseDelayMs * Math.pow(2, Math.max(0, attempt - 1)), maxDelayMs);
+        beginRetryStatus(requestInfo, attempt, 0, error.message);
+        log(`upstream error attempt=${attempt}/${maxAttempts} delay_ms=${delay}${formatRequestContext(requestInfo)} error=${error.message}`);
+        await waitForRetryDelay(requestInfo, control, attempt, delay);
+      }
+    }
+
+    throw new Error("retry loop exited unexpectedly");
+  } finally {
+    if (control && activeRequestControls.get(requestInfo.cascadeId) === control) {
+      activeRequestControls.delete(requestInfo.cascadeId);
+    }
+  }
+}
+
+function stopActiveRetry(cascadeId) {
+  if (!cascadeId) {
+    return { ok: false, statusCode: 400, message: "Missing cascadeId" };
+  }
+
+  const control = activeRequestControls.get(cascadeId);
+  if (!control) {
+    return { ok: false, statusCode: 409, message: `No active retry for cascade ${cascadeId}` };
+  }
+
+  requestStop(control);
+
+  return {
+    ok: true,
+    statusCode: 200,
+    requestInfo: control.requestInfo,
+  };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -518,6 +706,39 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.url === "/__stop" && req.method === "POST") {
+    try {
+      const body = await readBody(req);
+      let cascadeId = runtimeStatus.activeCascadeId || runtimeStatus.cascadeId || "";
+      if (body.length > 0) {
+        try {
+          const parsed = JSON.parse(body.toString("utf8"));
+          if (typeof parsed?.cascadeId === "string" && parsed.cascadeId.trim()) {
+            cascadeId = parsed.cascadeId.trim();
+          }
+        } catch {
+          // Ignore invalid JSON and fall back to the current active cascade.
+        }
+      }
+
+      const result = stopActiveRetry(cascadeId);
+      if (!result.ok) {
+        res.writeHead(result.statusCode, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, message: result.message, cascadeId }));
+        return;
+      }
+
+      log(`manual stop${formatRequestContext(result.requestInfo)}`);
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      res.end(JSON.stringify({ ok: true, cascadeId }));
+      return;
+    } catch (error) {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, message: error.message }));
+      return;
+    }
+  }
+
   let requestInfo = {
     path: req.url,
     model: "",
@@ -528,6 +749,30 @@ const server = http.createServer(async (req, res) => {
   try {
     const body = await readBody(req);
     requestInfo = extractRequestInfo(req, body);
+    let downstreamClosed = false;
+    const handleDownstreamClose = () => {
+      if (downstreamClosed) {
+        return;
+      }
+      downstreamClosed = true;
+      if (!requestInfo.cascadeId) {
+        return;
+      }
+      const control = activeRequestControls.get(requestInfo.cascadeId);
+      if (!control) {
+        return;
+      }
+      if (requestStop(control)) {
+        log(`downstream closed${formatRequestContext(requestInfo)}`);
+      }
+    };
+
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        handleDownstreamClose();
+      }
+    });
+
     log(`request method=${req.method}${formatRequestContext(requestInfo)}`);
     const { upstreamRes, responseBody } = await forwardRequest(req, body, requestInfo);
     const headers = { ...upstreamRes.headers };
@@ -543,6 +788,14 @@ const server = http.createServer(async (req, res) => {
       upstreamRes.pipe(res);
     }
   } catch (error) {
+    if (isRetryStoppedError(error)) {
+      if (!res.headersSent && !res.destroyed) {
+        res.writeHead(499, { "content-type": "application/json", "cache-control": "no-store" });
+        res.end(JSON.stringify({ error: "retry_stopped", message: error.message, cascadeId: requestInfo.cascadeId }));
+      }
+      return;
+    }
+
     if (runtimeStatus.path === req.url && runtimeStatus.cascadeId === requestInfo.cascadeId) {
       const failureStatus = {
         active: false,
