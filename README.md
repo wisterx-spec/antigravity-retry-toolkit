@@ -1,5 +1,7 @@
 # Antigravity Retry Toolkit
 
+English | [中文说明](README.zh-CN.md)
+
 A small macOS toolkit for Antigravity users who want transient model/backend failures to retry automatically and become visible instead of failing silently.
 
 Antigravity Retry Toolkit adds two capabilities to Antigravity:
