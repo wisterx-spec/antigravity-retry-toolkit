@@ -2,7 +2,7 @@
   "name": "retry-status-bar",
   "displayName": "Retry Status Bar",
   "description": "Show retry count and recent retry errors in the VS Code status bar.",
-  "version": "0.2.18",
+  "version": "0.2.24",
   "publisher": "wister-xue",
   "engines": {
     "vscode": "^1.90.0"
@@ -15,7 +15,13 @@
     "onCommand:retryStatusBar.showLog",
     "onCommand:retryStatusBar.refresh",
     "onCommand:retryStatusBar.stopCurrentRetry",
-    "onCommand:retryStatusBar.dumpAntigravityContext"
+    "onCommand:retryStatusBar.dumpAntigravityContext",
+    "onCommand:retryStatusBar.enableToolkit",
+    "onCommand:retryStatusBar.disableToolkit",
+    "onCommand:retryStatusBar.restartToolkit",
+    "onCommand:retryStatusBar.showToolkitStatus",
+    "onCommand:retryStatusBar.toggleToolkit",
+    "onCommand:retryStatusBar.uninstallToolkit"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -35,6 +41,30 @@
       {
         "command": "retryStatusBar.dumpAntigravityContext",
         "title": "Retry Status Bar: Dump Antigravity Context"
+      },
+      {
+        "command": "retryStatusBar.enableToolkit",
+        "title": "Retry Status Bar: Enable Toolkit"
+      },
+      {
+        "command": "retryStatusBar.disableToolkit",
+        "title": "Retry Status Bar: Disable Toolkit"
+      },
+      {
+        "command": "retryStatusBar.restartToolkit",
+        "title": "Retry Status Bar: Restart Toolkit"
+      },
+      {
+        "command": "retryStatusBar.showToolkitStatus",
+        "title": "Retry Status Bar: Show Toolkit Status"
+      },
+      {
+        "command": "retryStatusBar.toggleToolkit",
+        "title": "Retry Status Bar: Toggle Toolkit"
+      },
+      {
+        "command": "retryStatusBar.uninstallToolkit",
+        "title": "Retry Status Bar: Uninstall Toolkit"
       }
     ],
     "configuration": {

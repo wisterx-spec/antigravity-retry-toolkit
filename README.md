@@ -40,7 +40,7 @@ This toolkit fixes that by adding a local retry proxy and a lightweight status b
 
 ## Status
 
-- Current version: `0.2.18`
+- Current version: `0.2.24`
 - Platform target: macOS
 - Retry proxy status: verified locally
 - Multi-window, multi-conversation status isolation: verified locally
@@ -92,7 +92,7 @@ Source:
 
 Packaged VSIX:
 
-- [extension/retry-status-bar-0.2.18.vsix](extension/retry-status-bar-0.2.18.vsix)
+- [extension/retry-status-bar-0.2.24.vsix](extension/retry-status-bar-0.2.24.vsix)
 
 Behavior:
 
@@ -102,6 +102,7 @@ Behavior:
 - can show `0` while idle
 - shows recent events in the tooltip and output channel
 - lets you stop the current conversation retry manually from the tooltip or command palette
+- adds a persistent `Toolkit On` / `Toolkit Off` status bar toggle for enabling or pausing the whole toolkit without opening the command palette
 
 ## Quick start
 
@@ -130,7 +131,7 @@ Add this to Antigravity user settings:
 Inside Antigravity:
 
 1. Run `Extensions: Install from VSIX...`
-2. Choose `extension/retry-status-bar-0.2.18.vsix`
+2. Choose `extension/retry-status-bar-0.2.24.vsix`
 3. Run `Developer: Reload Window`
 
 ### 4. Stop a retry manually
@@ -141,6 +142,26 @@ If you want to stop the retry loop for the current conversation:
 2. Or click `Stop retry` in the status tooltip while a retry is active
 
 This stops the local retry loop for the active conversation. It does not patch or modify `Antigravity.app`.
+
+### 5. Turn The Toolkit On Or Off
+
+If you want a single switch for the whole toolkit, use:
+
+```bash
+./scripts/toolkit-control.sh on
+./scripts/toolkit-control.sh off
+./scripts/toolkit-control.sh status
+./scripts/toolkit-control.sh restart
+./scripts/toolkit-control.sh uninstall
+```
+
+What it does:
+
+- `on`: starts the local proxy and points Antigravity `jetski.cloudCodeUrl` to `http://127.0.0.1:38475`
+- `off`: stops the local proxy and restores the previous `jetski.cloudCodeUrl` value
+- `status`: shows whether Antigravity settings are currently pointing at the toolkit proxy and whether the proxy is loaded
+- `restart`: restarts the proxy and keeps the toolkit enabled
+- `uninstall`: restores the previous `jetski.cloudCodeUrl`, removes the proxy launch agent, deletes toolkit state/log files, and uninstalls the retry status bar extension from `~/.antigravity/extensions`
 
 ## Repository layout
 
@@ -175,7 +196,7 @@ What it does:
 If you only want to install a prebuilt VSIX without packaging again:
 
 ```bash
-./scripts/install-extension.sh extension/retry-status-bar-0.2.18.vsix
+./scripts/install-extension.sh extension/retry-status-bar-0.2.24.vsix
 ```
 
 If you want a pass/fail verification report and automatic Antigravity window reload:
@@ -212,11 +233,32 @@ The proxy reads configuration from environment variables.
 - `ANTIGRAVITY_PROXY_STATUS_HOLD_MS`
 - `ANTIGRAVITY_PROXY_QUOTA_STATUS_HOLD_MS`
 - `ANTIGRAVITY_PROXY_EVENT_HISTORY_LIMIT`
+- `ANTIGRAVITY_PROXY_ATTEMPT_HISTORY_LIMIT`
+- `ANTIGRAVITY_PROXY_ATTEMPT_LOG_PATH`
 - `ANTIGRAVITY_PROXY_DEBUG_REQUEST_IDENTIFIERS`
 
 The default install script writes those values into the generated `launchd` plist.
 By default, retry delays are capped at `5000ms`, so even if the upstream response suggests retrying after `15s`, the local proxy waits at most `5s`.
 Set `ANTIGRAVITY_PROXY_DEBUG_REQUEST_IDENTIFIERS=1` to log candidate request identifiers such as `cascadeId`, `conversationId`, `sessionId`, `requestId`, `threadId`, and `chatId` without dumping the full request body.
+
+## Diagnosing upstream hotspots
+
+The proxy now keeps a short per-attempt diagnostic history in `GET /__status`, in the extension diagnostic dump, and in a JSONL file at `~/Library/Logs/antigravity-cloudcode-proxy-attempts.jsonl` by default.
+Each attempt records:
+
+- a safe request-header allowlist such as `user-agent`, `x-goog-api-client`, `x-client-data`, `traceparent`, `grpc-timeout`, and `x-request-id`
+- the selected upstream IP and port
+- DNS / connect / TLS / first-byte / total timing
+- whether the socket was reused
+- HTTP version
+- a small allowlist of upstream headers such as `retry-after`, `x-envoy-upstream-service-time`, `server`, `via`, and `alt-svc`
+
+This does not prove Google routed a request to a specific overloaded machine, but it gives you enough evidence to answer narrower questions:
+
+- Do failures cluster on a small set of upstream IPs?
+- Do bad attempts have much higher `x-envoy-upstream-service-time` or `firstByteMs`?
+- Are retries failing on the same connection pattern but succeeding after a fresh resolution?
+- Is the issue a hard quota-style `429`, or a transient capacity / transport problem?
 
 ## Release artifact
 

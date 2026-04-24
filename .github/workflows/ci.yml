@@ -22,6 +22,7 @@ jobs:
           zsh -n scripts/install-extension.sh
           zsh -n scripts/install-proxy.sh
           zsh -n scripts/reload-antigravity-windows.sh
+          zsh -n scripts/toolkit-control.sh
           zsh -n scripts/uninstall-proxy.sh
           zsh -n scripts/verify-dev-loop.sh
 
@@ -29,6 +30,11 @@ jobs:
         run: |
           node --check proxy/antigravity-cloudcode-proxy.js
           node --check extension/extension.js
+          node --check scripts/generate-language-server-inventory.js
+
+      - name: Validate Python syntax
+        run: |
+          python3 -m py_compile scripts/summarize-attempt-diagnostics.py
 
       - name: Package VSIX
         run: |

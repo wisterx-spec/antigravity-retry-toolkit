@@ -1,9 +1,14 @@
 const vscode = require("vscode");
 const fs = require("fs/promises");
+const childProcess = require("child_process");
 const http = require("http");
 const https = require("https");
 const os = require("os");
 const path = require("path");
+const util = require("util");
+
+const execFileAsync = util.promisify(childProcess.execFile);
+const toolkitLabel = "com.wister.antigravity-cloudcode-proxy";
 
 function formatTime(timestamp) {
   if (!timestamp) {
@@ -214,15 +219,85 @@ function getExtensionRegistryPath() {
   return path.join(os.homedir(), ".antigravity", "extensions", "extensions.json");
 }
 
+function getHealthUrl(statusUrl) {
+  try {
+    const url = new URL(statusUrl);
+    url.pathname = "/__health";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return "http://127.0.0.1:38475/__health";
+  }
+}
+
+function getToolkitPaths(proxyPort) {
+  const settingsDir = path.join(os.homedir(), "Library", "Application Support", "Antigravity", "User");
+  return {
+    launchdDomain: `gui/${process.getuid?.() ?? process.pid}`,
+    launchdTarget: `gui/${process.getuid?.() ?? process.pid}/${toolkitLabel}`,
+    plistPath: path.join(os.homedir(), "Library", "LaunchAgents", `${toolkitLabel}.plist`),
+    settingsDir,
+    settingsPath: path.join(settingsDir, "settings.json"),
+    statePath: path.join(settingsDir, "antigravity-retry-toolkit-state.json"),
+    proxyUrl: `http://127.0.0.1:${proxyPort}`,
+  };
+}
+
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readJsonFile(filePath, fallback) {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeJsonFile(filePath, value) {
+  await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function removePathIfExists(filePath) {
+  try {
+    await fs.rm(filePath, { recursive: true, force: true });
+  } catch {
+    // Ignore cleanup failures for already-removed files.
+  }
+}
+
+function getExtensionsHome() {
+  return path.dirname(getExtensionRegistryPath());
+}
+
+function getExtensionObsoletePath() {
+  return path.join(getExtensionsHome(), ".obsolete");
+}
+
 class RetryStatusBarController {
   constructor(context) {
     this.context = context;
     this.output = vscode.window.createOutputChannel("Retry Status Bar");
+    this.toolkitStatusBar = vscode.window.createStatusBarItem("retryStatusBar.toolkit", vscode.StatusBarAlignment.Left, 1001);
+    this.toolkitStatusBar.name = "Retry Toolkit";
+    this.toolkitStatusBar.command = "retryStatusBar.toggleToolkit";
     this.statusBar = vscode.window.createStatusBarItem("retryStatusBar.item", vscode.StatusBarAlignment.Left, 1000);
     this.statusBar.name = "Retry Status Bar";
     this.statusBar.command = "retryStatusBar.showLog";
     this.lastEventId = 0;
     this.lastStatusSignature = "";
+    this.lastToolkitSignature = "";
+    this.lastToolkitStatus = undefined;
+    this.lastToolkitStatusAt = 0;
+    this.logBuffer = [];
+    this.maxLogLines = 200;
     this.timer = undefined;
     this.windowKey = "";
     this.activeCascadeId = "";
@@ -233,12 +308,18 @@ class RetryStatusBarController {
     this.versionMonitorTimer = undefined;
     this.reloadRequestedForVersion = "";
 
-    context.subscriptions.push(this.output, this.statusBar);
+    context.subscriptions.push(this.output, this.statusBar, this.toolkitStatusBar);
     context.subscriptions.push(
-      vscode.commands.registerCommand("retryStatusBar.showLog", () => this.output.show(true)),
+      vscode.commands.registerCommand("retryStatusBar.showLog", () => this.showLog()),
       vscode.commands.registerCommand("retryStatusBar.refresh", () => this.refreshNow()),
       vscode.commands.registerCommand("retryStatusBar.stopCurrentRetry", () => this.stopCurrentRetry()),
       vscode.commands.registerCommand("retryStatusBar.dumpAntigravityContext", () => this.dumpAntigravityContext()),
+      vscode.commands.registerCommand("retryStatusBar.enableToolkit", () => this.enableToolkit()),
+      vscode.commands.registerCommand("retryStatusBar.disableToolkit", () => this.disableToolkit()),
+      vscode.commands.registerCommand("retryStatusBar.restartToolkit", () => this.restartToolkit()),
+      vscode.commands.registerCommand("retryStatusBar.showToolkitStatus", () => this.showToolkitStatus()),
+      vscode.commands.registerCommand("retryStatusBar.toggleToolkit", () => this.toggleToolkit()),
+      vscode.commands.registerCommand("retryStatusBar.uninstallToolkit", () => this.uninstallToolkit()),
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (event.affectsConfiguration("retryStatusBar")) {
           this.restart();
@@ -248,9 +329,26 @@ class RetryStatusBarController {
   }
 
   start() {
+    this.log(`Extension started v${this.context.extension?.packageJSON?.version || "unknown"}`);
     this.initializeCascadeTracking();
     this.restart();
     this.startInstalledVersionMonitor();
+  }
+
+  log(message) {
+    const line = `${new Date().toLocaleTimeString()}  ${message}`;
+    this.logBuffer.push(line);
+    if (this.logBuffer.length > this.maxLogLines) {
+      this.logBuffer.shift();
+    }
+    this.output.appendLine(line);
+  }
+
+  async showLog() {
+    if (this.logBuffer.length === 0) {
+      this.log("Log opened");
+    }
+    this.output.show(true);
   }
 
   stopRefreshTimer() {
@@ -276,6 +374,17 @@ class RetryStatusBarController {
     }
   }
 
+  async getToolkitStatusCached(force = false) {
+    const now = Date.now();
+    if (!force && this.lastToolkitStatus && now - this.lastToolkitStatusAt < 3000) {
+      return this.lastToolkitStatus;
+    }
+    const status = await this.getToolkitStatus();
+    this.lastToolkitStatus = status;
+    this.lastToolkitStatusAt = now;
+    return status;
+  }
+
   restart() {
     this.stopRefreshTimer();
     this.refreshNow();
@@ -289,12 +398,322 @@ class RetryStatusBarController {
     const config = vscode.workspace.getConfiguration("retryStatusBar");
     return {
       statusUrl: config.get("statusUrl", "http://127.0.0.1:38475/__status"),
+      healthUrl: getHealthUrl(config.get("statusUrl", "http://127.0.0.1:38475/__status")),
       stopUrl: config.get("stopUrl", "http://127.0.0.1:38475/__stop"),
       pollIntervalMs: config.get("pollIntervalMs", 1000),
       showWhenIdle: config.get("showWhenIdle", true),
       idleText: config.get("idleText", "0"),
       maxTooltipEvents: config.get("maxTooltipEvents", 8),
     };
+  }
+
+  async runLaunchctl(args, options = {}) {
+    try {
+      return await execFileAsync("launchctl", args);
+    } catch (error) {
+      if (options.ignoreFailure) {
+        return { stdout: "", stderr: typeof error?.stderr === "string" ? error.stderr : "" };
+      }
+      throw new Error(typeof error?.stderr === "string" && error.stderr.trim() ? error.stderr.trim() : error.message);
+    }
+  }
+
+  async ensureToolkitSettingsFile(toolkitPaths) {
+    await fs.mkdir(toolkitPaths.settingsDir, { recursive: true });
+    if (!(await fileExists(toolkitPaths.settingsPath))) {
+      await fs.writeFile(toolkitPaths.settingsPath, "{}\n", "utf8");
+    }
+  }
+
+  async updateToolkitSettings(mode) {
+    const toolkitPaths = getToolkitPaths(this.getProxyPort());
+    await this.ensureToolkitSettingsFile(toolkitPaths);
+
+    const settings = await readJsonFile(toolkitPaths.settingsPath, {});
+    const state = await readJsonFile(toolkitPaths.statePath, {});
+    const currentUrl = typeof settings["jetski.cloudCodeUrl"] === "string" ? settings["jetski.cloudCodeUrl"] : "";
+
+    if (mode === "enable") {
+      if (currentUrl !== toolkitPaths.proxyUrl) {
+        if (currentUrl) {
+          state.previousCloudCodeUrl = currentUrl;
+          state.hadPreviousCloudCodeUrl = true;
+        } else {
+          delete state.previousCloudCodeUrl;
+          state.hadPreviousCloudCodeUrl = false;
+        }
+        settings["jetski.cloudCodeUrl"] = toolkitPaths.proxyUrl;
+      }
+      state.enabled = true;
+    } else {
+      if (state.hadPreviousCloudCodeUrl && typeof state.previousCloudCodeUrl === "string" && state.previousCloudCodeUrl) {
+        settings["jetski.cloudCodeUrl"] = state.previousCloudCodeUrl;
+      } else {
+        delete settings["jetski.cloudCodeUrl"];
+      }
+      state.enabled = false;
+    }
+
+    state.proxyUrl = toolkitPaths.proxyUrl;
+    state.updatedAt = new Date().toISOString();
+    await fs.writeFile(toolkitPaths.settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+    await fs.writeFile(toolkitPaths.statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    return { toolkitPaths, settings, state };
+  }
+
+  getProxyPort() {
+    const statusUrl = this.getConfig().statusUrl;
+    try {
+      return new URL(statusUrl).port || "38475";
+    } catch {
+      return "38475";
+    }
+  }
+
+  async getToolkitStatus() {
+    const toolkitPaths = getToolkitPaths(this.getProxyPort());
+    const config = this.getConfig();
+    const settings = await readJsonFile(toolkitPaths.settingsPath, {});
+    const state = await readJsonFile(toolkitPaths.statePath, {});
+    let proxyLoaded = false;
+    try {
+      await this.runLaunchctl(["print", toolkitPaths.launchdTarget]);
+      proxyLoaded = true;
+    } catch {
+      proxyLoaded = false;
+    }
+
+    let proxyHealthy = false;
+    let healthError = "";
+    let healthPayload = undefined;
+    try {
+      healthPayload = await this.fetchStatus(config.healthUrl);
+      proxyHealthy = Boolean(healthPayload?.ok);
+    } catch (error) {
+      proxyHealthy = false;
+      healthError = typeof error?.message === "string" ? error.message : String(error);
+    }
+
+    const toolkitEnabledInSettings = settings["jetski.cloudCodeUrl"] === toolkitPaths.proxyUrl;
+    let mode = "off";
+    if (toolkitEnabledInSettings && proxyHealthy) {
+      mode = "on";
+    } else if (toolkitEnabledInSettings && proxyLoaded) {
+      mode = "starting";
+    } else if (toolkitEnabledInSettings) {
+      mode = "error";
+    } else if (proxyLoaded || proxyHealthy) {
+      mode = "paused";
+    }
+
+    return {
+      settingsPath: toolkitPaths.settingsPath,
+      statePath: toolkitPaths.statePath,
+      currentCloudCodeUrl: typeof settings["jetski.cloudCodeUrl"] === "string" ? settings["jetski.cloudCodeUrl"] : "",
+      proxyUrl: toolkitPaths.proxyUrl,
+      toolkitEnabledInSettings,
+      rememberedPreviousCloudCodeUrl: state.previousCloudCodeUrl || "",
+      stateEnabled: Boolean(state.enabled),
+      proxyPlistPath: toolkitPaths.plistPath,
+      proxyPlistExists: await fileExists(toolkitPaths.plistPath),
+      proxyLoaded,
+      proxyHealthy,
+      healthError,
+      healthUrl: config.healthUrl,
+      healthPayload,
+      mode,
+    };
+  }
+
+  async startToolkitProxy() {
+    const toolkitPaths = getToolkitPaths(this.getProxyPort());
+    if (!(await fileExists(toolkitPaths.plistPath))) {
+      throw new Error(`Proxy plist not found: ${toolkitPaths.plistPath}. Run scripts/install-proxy.sh once first.`);
+    }
+    await this.runLaunchctl(["enable", toolkitPaths.launchdTarget], { ignoreFailure: true });
+    await this.runLaunchctl(["bootstrap", toolkitPaths.launchdDomain, toolkitPaths.plistPath], { ignoreFailure: true });
+    await this.runLaunchctl(["kickstart", "-k", toolkitPaths.launchdTarget], { ignoreFailure: true });
+  }
+
+  async stopToolkitProxy() {
+    const toolkitPaths = getToolkitPaths(this.getProxyPort());
+    if (!(await fileExists(toolkitPaths.plistPath))) {
+      return;
+    }
+    await this.runLaunchctl(["bootout", toolkitPaths.launchdDomain, toolkitPaths.plistPath], { ignoreFailure: true });
+    await this.runLaunchctl(["disable", toolkitPaths.launchdTarget], { ignoreFailure: true });
+  }
+
+  async enableToolkit() {
+    try {
+      await this.startToolkitProxy();
+      const { toolkitPaths } = await this.updateToolkitSettings("enable");
+      this.lastToolkitStatus = undefined;
+      this.lastToolkitStatusAt = 0;
+      this.log(`[diag] Toolkit enabled: ${toolkitPaths.proxyUrl}`);
+      await this.refreshNow();
+    } catch (error) {
+      const message = typeof error?.message === "string" ? error.message : String(error);
+      this.log(`[diag] Toolkit enable failed: ${message}`);
+      vscode.window.showErrorMessage(`Retry Status Bar: ${message}`);
+    }
+  }
+
+  async disableToolkit() {
+    try {
+      await this.updateToolkitSettings("disable");
+      await this.stopToolkitProxy();
+      this.lastToolkitStatus = undefined;
+      this.lastToolkitStatusAt = 0;
+      this.log("[diag] Toolkit disabled");
+      await this.refreshNow();
+    } catch (error) {
+      const message = typeof error?.message === "string" ? error.message : String(error);
+      this.log(`[diag] Toolkit disable failed: ${message}`);
+      vscode.window.showErrorMessage(`Retry Status Bar: ${message}`);
+    }
+  }
+
+  async cleanupToolkitArtifacts() {
+    const toolkitPaths = getToolkitPaths(this.getProxyPort());
+    const pathsToRemove = [
+      toolkitPaths.plistPath,
+      toolkitPaths.statePath,
+      path.join(os.homedir(), "Library", "Logs", "antigravity-cloudcode-proxy.log"),
+      path.join(os.homedir(), "Library", "Logs", "antigravity-cloudcode-proxy-attempts.jsonl"),
+    ];
+    await Promise.all(pathsToRemove.map((filePath) => removePathIfExists(filePath)));
+  }
+
+  async uninstallInstalledExtension() {
+    const packageJson = this.context.extension?.packageJSON;
+    const extensionId = packageJson ? `${packageJson.publisher}.${packageJson.name}` : "";
+    if (!extensionId) {
+      return { extensionId: "", removedDirectories: [] };
+    }
+
+    const extensionsHome = getExtensionsHome();
+    const registryPath = getExtensionRegistryPath();
+    const obsoletePath = getExtensionObsoletePath();
+
+    await fs.mkdir(extensionsHome, { recursive: true });
+
+    const registry = await readJsonFile(registryPath, []);
+    const nextRegistry = Array.isArray(registry)
+      ? registry.filter((entry) => entry?.identifier?.id !== extensionId)
+      : [];
+    await writeJsonFile(registryPath, nextRegistry);
+
+    const obsolete = await readJsonFile(obsoletePath, {});
+    const directoryEntries = await fs.readdir(extensionsHome, { withFileTypes: true });
+    const removedDirectories = [];
+
+    for (const entry of directoryEntries) {
+      if (!entry.isDirectory() || !entry.name.startsWith(`${extensionId}-`)) {
+        continue;
+      }
+      removedDirectories.push(path.join(extensionsHome, entry.name));
+      obsolete[entry.name] = true;
+    }
+
+    await writeJsonFile(obsoletePath, obsolete);
+
+    if (removedDirectories.length) {
+      const cleanupScript = `
+        const fs = require("fs");
+        const targets = ${JSON.stringify(removedDirectories)};
+        setTimeout(() => {
+          for (const target of targets) {
+            try {
+              fs.rmSync(target, { recursive: true, force: true });
+            } catch {}
+          }
+        }, 1500);
+      `;
+      const cleanupProcess = childProcess.spawn(process.execPath, ["-e", cleanupScript], {
+        detached: true,
+        stdio: "ignore",
+      });
+      cleanupProcess.unref();
+    }
+
+    return { extensionId, removedDirectories };
+  }
+
+  async uninstallToolkit() {
+    const decision = await vscode.window.showWarningMessage(
+      "Uninstall Retry Toolkit? This restores cloudCodeUrl, removes the local proxy launch agent, and uninstalls the status bar extension.",
+      { modal: true },
+      "Uninstall",
+    );
+    if (decision !== "Uninstall") {
+      return;
+    }
+
+    try {
+      await this.updateToolkitSettings("disable");
+      await this.stopToolkitProxy();
+      await this.cleanupToolkitArtifacts();
+      const extensionRemoval = await this.uninstallInstalledExtension();
+      this.lastToolkitStatus = undefined;
+      this.lastToolkitStatusAt = 0;
+      this.log(
+        `[diag] Toolkit uninstalled${extensionRemoval.extensionId ? `: ${extensionRemoval.extensionId}` : ""}`,
+      );
+      await this.refreshNow();
+      vscode.window.showInformationMessage("Retry toolkit uninstalled. Reloading window to finish cleanup.");
+      setTimeout(() => {
+        vscode.commands.executeCommand("workbench.action.reloadWindow");
+      }, 300);
+    } catch (error) {
+      const message = typeof error?.message === "string" ? error.message : String(error);
+      this.log(`[diag] Toolkit uninstall failed: ${message}`);
+      vscode.window.showErrorMessage(`Retry Status Bar: ${message}`);
+    }
+  }
+
+  async restartToolkit() {
+    try {
+      await this.stopToolkitProxy();
+      await this.startToolkitProxy();
+      const { toolkitPaths } = await this.updateToolkitSettings("enable");
+      this.lastToolkitStatus = undefined;
+      this.lastToolkitStatusAt = 0;
+      this.log(`[diag] Toolkit restarted: ${toolkitPaths.proxyUrl}`);
+      await this.refreshNow();
+    } catch (error) {
+      const message = typeof error?.message === "string" ? error.message : String(error);
+      this.log(`[diag] Toolkit restart failed: ${message}`);
+      vscode.window.showErrorMessage(`Retry Status Bar: ${message}`);
+    }
+  }
+
+  async showToolkitStatus() {
+    const status = await this.getToolkitStatusCached(true);
+    this.log("[diag] Toolkit status");
+    this.output.appendLine(formatJson(status));
+    this.output.show(true);
+    const summary = {
+      on: "enabled and healthy",
+      starting: "enabled, proxy is starting",
+      error: "enabled, but proxy is unavailable",
+      paused: "paused",
+      off: "off",
+    }[status.mode] || "unknown";
+    vscode.window.showInformationMessage(`Retry Status Bar: ${summary}`);
+  }
+
+  async toggleToolkit() {
+    const status = await this.getToolkitStatusCached(true);
+    if (status.mode === "on") {
+      await this.disableToolkit();
+      return;
+    }
+    if (status.mode === "starting" || status.mode === "error") {
+      await this.restartToolkit();
+      return;
+    }
+    await this.enableToolkit();
   }
 
   startInstalledVersionMonitor() {
@@ -340,16 +759,125 @@ class RetryStatusBarController {
   }
 
   async refreshNow() {
+    const toolkitStatus = await this.getToolkitStatusCached();
+    this.renderToolkitStatus(toolkitStatus);
+
     try {
+      if (toolkitStatus.mode === "off" || toolkitStatus.mode === "paused") {
+        this.renderDisabledRetryStatus();
+        return;
+      }
       const status = await this.fetchStatus(this.getConfig().statusUrl);
       const scopedStatus = this.getScopedStatus(status);
       this.consumeEvents(scopedStatus.events || []);
       this.render(scopedStatus);
     } catch (error) {
-      this.statusBar.text = "$(warning) Retry status unavailable";
-      this.statusBar.tooltip = typeof error?.message === "string" ? error.message : String(error);
+      this.renderRetryUnavailable(toolkitStatus, error);
       this.statusBar.show();
     }
+  }
+
+  renderToolkitStatus(status) {
+    const effectiveStatus = status || {
+      mode: "off",
+      toolkitEnabledInSettings: false,
+      proxyLoaded: false,
+      proxyHealthy: false,
+      currentCloudCodeUrl: "",
+      proxyUrl: `http://127.0.0.1:${this.getProxyPort()}`,
+    };
+
+    const signature = JSON.stringify({
+      mode: effectiveStatus.mode,
+      toolkitEnabledInSettings: effectiveStatus.toolkitEnabledInSettings,
+      proxyLoaded: effectiveStatus.proxyLoaded,
+      proxyHealthy: effectiveStatus.proxyHealthy,
+      currentCloudCodeUrl: effectiveStatus.currentCloudCodeUrl,
+      proxyUrl: effectiveStatus.proxyUrl,
+    });
+
+    if (signature === this.lastToolkitSignature && this.toolkitStatusBar.text) {
+      return;
+    }
+    this.lastToolkitSignature = signature;
+
+    this.toolkitStatusBar.backgroundColor = undefined;
+    this.toolkitStatusBar.color = undefined;
+
+    if (effectiveStatus.mode === "on") {
+      this.toolkitStatusBar.text = "$(shield) Toolkit On";
+      this.toolkitStatusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.prominentBackground");
+    } else if (effectiveStatus.mode === "starting") {
+      this.toolkitStatusBar.text = "$(sync~spin) Toolkit Starting";
+      this.toolkitStatusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+    } else if (effectiveStatus.mode === "error") {
+      this.toolkitStatusBar.text = "$(error) Toolkit Error";
+      this.toolkitStatusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
+    } else if (effectiveStatus.mode === "paused") {
+      this.toolkitStatusBar.text = "$(debug-pause) Toolkit Paused";
+    } else {
+      this.toolkitStatusBar.text = "$(circle-slash) Toolkit Off";
+    }
+
+    const md = new vscode.MarkdownString(undefined, true);
+    md.isTrusted = true;
+    md.appendMarkdown(`**Retry Toolkit**\n\n`);
+    md.appendMarkdown(`- Mode: ${effectiveStatus.mode || "off"}\n`);
+    md.appendMarkdown(`- Settings enabled: ${effectiveStatus.toolkitEnabledInSettings ? "yes" : "no"}\n`);
+    md.appendMarkdown(`- Proxy loaded: ${effectiveStatus.proxyLoaded ? "yes" : "no"}\n`);
+    md.appendMarkdown(`- Proxy healthy: ${effectiveStatus.proxyHealthy ? "yes" : "no"}\n`);
+    md.appendMarkdown(`- Proxy URL: ${effectiveStatus.proxyUrl || "-"}\n`);
+    md.appendMarkdown(`- Current cloudCodeUrl: ${effectiveStatus.currentCloudCodeUrl || "-"}\n`);
+    if (effectiveStatus.healthError) {
+      md.appendMarkdown(`- Health error: ${effectiveStatus.healthError}\n`);
+    }
+    if (effectiveStatus.mode === "on") {
+      md.appendMarkdown(`\nClick the status bar item to pause the toolkit.\n`);
+    } else if (effectiveStatus.mode === "starting" || effectiveStatus.mode === "error") {
+      md.appendMarkdown(`\nClick the status bar item to restart the toolkit.\n`);
+    } else {
+      md.appendMarkdown(`\nClick the status bar item to enable the toolkit.\n`);
+    }
+    md.appendMarkdown(
+      `\n[Restart](command:retryStatusBar.restartToolkit) · [Status](command:retryStatusBar.showToolkitStatus) · [Uninstall](command:retryStatusBar.uninstallToolkit)`,
+    );
+    this.toolkitStatusBar.tooltip = md;
+    this.toolkitStatusBar.show();
+  }
+
+  renderDisabledRetryStatus() {
+    const config = this.getConfig();
+    if (config.showWhenIdle) {
+      this.statusBar.backgroundColor = undefined;
+      this.statusBar.color = undefined;
+      this.statusBar.text = `$(debug-alt-small) ${config.idleText}`;
+      this.statusBar.tooltip = "Retry toolkit is currently off.";
+      this.statusBar.show();
+      return;
+    }
+    this.statusBar.hide();
+  }
+
+  renderRetryUnavailable(toolkitStatus, error) {
+    const message = typeof error?.message === "string" ? error.message : String(error);
+    this.statusBar.backgroundColor = undefined;
+    this.statusBar.color = undefined;
+
+    if (toolkitStatus?.mode === "starting") {
+      this.statusBar.text = "$(sync~spin) Proxy Starting";
+      this.statusBar.tooltip = `Toolkit is starting.\n\n${message}`;
+      return;
+    }
+
+    if (toolkitStatus?.mode === "error") {
+      this.statusBar.text = "$(warning) Proxy Unavailable";
+      this.statusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+      this.statusBar.tooltip = `Toolkit is enabled, but the local proxy is unavailable.\n\n${message}`;
+      return;
+    }
+
+    this.statusBar.text = "$(warning) Retry status unavailable";
+    this.statusBar.tooltip = message;
   }
 
   fetchStatus(urlString) {
@@ -462,7 +990,7 @@ class RetryStatusBarController {
         continue;
       }
       this.lastEventId = event.id;
-      this.output.appendLine(formatEventLine(event));
+      this.log(formatEventLine(event));
     }
   }
 
@@ -474,12 +1002,12 @@ class RetryStatusBarController {
 
     try {
       await this.postJson(this.getConfig().stopUrl, { cascadeId: this.activeCascadeId });
-      this.output.appendLine(`[diag] Manual stop requested for cascade ${this.activeCascadeId}`);
+      this.log(`[diag] Manual stop requested for cascade ${this.activeCascadeId}`);
       await this.refreshNow();
       vscode.window.showInformationMessage(`Retry Status Bar: stopped retry for ${this.activeCascadeId}`);
     } catch (error) {
       const message = typeof error?.message === "string" ? error.message : String(error);
-      this.output.appendLine(`[diag] Manual stop failed for ${this.activeCascadeId}: ${message}`);
+      this.log(`[diag] Manual stop failed for ${this.activeCascadeId}: ${message}`);
       vscode.window.showErrorMessage(`Retry Status Bar: ${message}`);
     }
   }
@@ -487,7 +1015,7 @@ class RetryStatusBarController {
   async initializeCascadeTracking() {
     const unifiedStateSync = vscode.antigravityUnifiedStateSync;
     if (!unifiedStateSync || typeof unifiedStateSync.subscribe !== "function") {
-      this.output.appendLine("[diag] antigravityUnifiedStateSync is unavailable; falling back to global retry status.");
+      this.log("[diag] antigravityUnifiedStateSync is unavailable; falling back to global retry status.");
       return;
     }
 
@@ -531,7 +1059,7 @@ class RetryStatusBarController {
         },
       });
     } catch (error) {
-      this.output.appendLine(
+      this.log(
         `[diag] Failed to subscribe to unified state topics: ${typeof error?.message === "string" ? error.message : String(error)}`,
       );
     }
@@ -545,7 +1073,7 @@ class RetryStatusBarController {
     }
     this.windowKey = nextWindowKey;
     this.activeCascadeId = nextCascadeId;
-    this.output.appendLine(`[diag] Active cascade for workspace window ${this.windowKey || "-"}: ${this.activeCascadeId || "-"}`);
+    this.log(`[diag] Active cascade for workspace window ${this.windowKey || "-"}: ${this.activeCascadeId || "-"}`);
     this.refreshNow();
   }
 
@@ -705,6 +1233,10 @@ class RetryStatusBarController {
     const antigravityWorkbenchTrace = await tryExecuteCommand("antigravity.getWorkbenchTrace");
     const antigravityManagerTrace = await tryExecuteCommand("antigravity.getManagerTrace");
     const antigravityManagerStatus = await tryExecuteCommand("antigravityAgentManager.reportStatus");
+    const retryProxyStatus = await this.fetchStatus(this.getConfig().statusUrl).then(
+      (value) => ({ ok: true, value }),
+      (error) => ({ ok: false, error: typeof error?.message === "string" ? error.message : String(error) }),
+    );
     const unifiedStateSync = vscode.antigravityUnifiedStateSync;
     const activeCascadeTopic = unifiedStateSync ? await unifiedStateSync.subscribe("uss-activeCascadeIds") : undefined;
     const windowConfigsTopic = unifiedStateSync ? await unifiedStateSync.subscribe("uss-windowConfigs") : undefined;
@@ -781,6 +1313,7 @@ class RetryStatusBarController {
       antigravityWorkbenchTrace,
       antigravityManagerTrace,
       antigravityManagerStatus,
+      retryProxyStatus,
     };
 
     if (typeof activeCascadeTopic?.dispose === "function") {
@@ -794,9 +1327,9 @@ class RetryStatusBarController {
     }
 
     await fs.writeFile(dumpPath, `${formatJson(payload)}\n`, "utf8");
-    this.output.appendLine("[diag] Antigravity context");
+    this.log("[diag] Antigravity context");
     this.output.appendLine(formatJson(payload));
-    this.output.appendLine(`[diag] Saved to ${dumpPath}`);
+    this.log(`[diag] Saved to ${dumpPath}`);
     this.output.show(true);
     vscode.window.showInformationMessage(`Retry Status Bar: diagnostic context written to ${dumpPath}`);
   }

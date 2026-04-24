@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.24
+
+- Add full toolkit uninstall support that restores settings, removes the proxy launch agent, and unregisters installed retry-status-bar extensions
+
+## 0.2.19
+
+- Include proxy status payloads in the diagnostic dump
+- Preserve per-attempt upstream diagnostics and a safe request-header allowlist for hotspot analysis
+
 ## 0.2.18
 
 - Add a manual stop command for the current conversation retry

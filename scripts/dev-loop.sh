@@ -61,8 +61,13 @@ echo "[1/5] validating scripts and source syntax"
 zsh -n "${SCRIPT_DIR}/install-proxy.sh"
 zsh -n "${SCRIPT_DIR}/uninstall-proxy.sh"
 zsh -n "${SCRIPT_DIR}/install-extension.sh"
+zsh -n "${SCRIPT_DIR}/reload-antigravity-windows.sh"
+zsh -n "${SCRIPT_DIR}/toolkit-control.sh"
+zsh -n "${SCRIPT_DIR}/verify-dev-loop.sh"
 node --check "${PROXY_SCRIPT}"
 node --check "${EXTENSION_SCRIPT}"
+node --check "${SCRIPT_DIR}/generate-language-server-inventory.js"
+python3 -m py_compile "${SCRIPT_DIR}/summarize-attempt-diagnostics.py"
 
 VSIX_PATH="$(ls -1t "${EXTENSION_DIR}"/retry-status-bar-*.vsix 2>/dev/null | head -n 1 || true)"
 

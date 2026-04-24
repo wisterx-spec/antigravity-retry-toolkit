@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 
+const fs = require("fs/promises");
+const dns = require("dns");
 const http = require("http");
 const https = require("https");
+const os = require("os");
+const path = require("path");
 
 const port = Number(process.env.ANTIGRAVITY_PROXY_PORT || "38475");
 const targetHost = process.env.ANTIGRAVITY_PROXY_TARGET_HOST || "daily-cloudcode-pa.googleapis.com";
@@ -12,8 +16,45 @@ const retryableStatuses = new Set([429, 500, 502, 503, 504]);
 const statusHoldMs = Number(process.env.ANTIGRAVITY_PROXY_STATUS_HOLD_MS || "5000");
 const quotaStatusHoldMs = Number(process.env.ANTIGRAVITY_PROXY_QUOTA_STATUS_HOLD_MS || "20000");
 const eventHistoryLimit = Number(process.env.ANTIGRAVITY_PROXY_EVENT_HISTORY_LIMIT || "25");
+const attemptHistoryLimit = Number(process.env.ANTIGRAVITY_PROXY_ATTEMPT_HISTORY_LIMIT || "10");
+const attemptLogPath =
+  process.env.ANTIGRAVITY_PROXY_ATTEMPT_LOG_PATH || path.join(os.homedir(), "Library", "Logs", "antigravity-cloudcode-proxy-attempts.jsonl");
+const streamFreshConnectEnabled = process.env.ANTIGRAVITY_PROXY_STREAM_FRESH_CONNECT !== "0";
+const streamFreshConnectOnFirstAttempt = process.env.ANTIGRAVITY_PROXY_STREAM_FRESH_CONNECT_ON_FIRST_ATTEMPT === "1";
+const streamBadAddressTtlMs = Number(process.env.ANTIGRAVITY_PROXY_STREAM_BAD_ADDRESS_TTL_MS || "300000");
+const streamAddressSignalTtlMs = Number(process.env.ANTIGRAVITY_PROXY_STREAM_ADDRESS_SIGNAL_TTL_MS || "600000");
+const streamSlowSuccessMs = Number(process.env.ANTIGRAVITY_PROXY_STREAM_SLOW_SUCCESS_MS || "15000");
+const streamTotalBudgetMs = Number(process.env.ANTIGRAVITY_PROXY_STREAM_TOTAL_BUDGET_MS || "90000");
+const streamMinRemainingBudgetMs = Number(process.env.ANTIGRAVITY_PROXY_STREAM_MIN_REMAINING_BUDGET_MS || "5000");
+const streamCapacity429BackoffMs = Number(process.env.ANTIGRAVITY_PROXY_STREAM_CAPACITY_429_BACKOFF_MS || "5000");
 const debugRequestIdentifiers = process.env.ANTIGRAVITY_PROXY_DEBUG_REQUEST_IDENTIFIERS === "1";
 const requestIdentifierCandidates = new Set(["cascadeid", "conversationid", "sessionid", "requestid", "threadid", "chatid"]);
+const diagnosticHeaderNames = [
+  "server",
+  "via",
+  "alt-svc",
+  "retry-after",
+  "x-envoy-upstream-service-time",
+  "x-guploader-uploadid",
+  "x-request-id",
+  "x-cloud-trace-context",
+  "traceparent",
+  "grpc-status",
+  "grpc-message",
+];
+const diagnosticRequestHeaderNames = [
+  "accept",
+  "accept-encoding",
+  "content-type",
+  "grpc-timeout",
+  "te",
+  "traceparent",
+  "user-agent",
+  "x-client-data",
+  "x-goog-api-client",
+  "x-goog-request-params",
+  "x-request-id",
+];
 
 let nextEventId = 1;
 
@@ -30,6 +71,8 @@ function createStatusSnapshot(cascadeId = "") {
     message: "",
     updatedAt: 0,
     events: [],
+    lastAttempt: null,
+    attemptDiagnostics: [],
   };
 }
 
@@ -42,12 +85,22 @@ const runtimeStatus = {
 const cascadeStatuses = new Map();
 const cascadeClearTimers = new Map();
 const activeRequestControls = new Map();
+const recentBadStreamAddresses = new Map();
+const streamAddressSignals = new Map();
 
 class RetryStoppedError extends Error {
   constructor(message = "Retry stopped by user") {
     super(message);
     this.name = "RetryStoppedError";
     this.code = "RETRY_STOPPED";
+  }
+}
+
+class RetryBudgetExceededError extends Error {
+  constructor(message = "Retry budget exceeded") {
+    super(message);
+    this.name = "RetryBudgetExceededError";
+    this.code = "RETRY_BUDGET_EXCEEDED";
   }
 }
 
@@ -60,8 +113,102 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function pruneRecentBadStreamAddresses(now = Date.now()) {
+  for (const [address, expiresAt] of [...recentBadStreamAddresses.entries()]) {
+    if (expiresAt <= now) {
+      recentBadStreamAddresses.delete(address);
+    }
+  }
+}
+
+function markRecentBadStreamAddress(address) {
+  if (!address || !streamBadAddressTtlMs) {
+    return;
+  }
+  pruneRecentBadStreamAddresses();
+  recentBadStreamAddresses.set(address, Date.now() + streamBadAddressTtlMs);
+}
+
+function pruneExpiredStreamAddressSignals(now = Date.now()) {
+  for (const [address, signals] of [...streamAddressSignals.entries()]) {
+    const activeSignals = signals.filter((signal) => signal.expiresAt > now);
+    if (activeSignals.length) {
+      streamAddressSignals.set(address, activeSignals);
+      continue;
+    }
+    streamAddressSignals.delete(address);
+  }
+}
+
+function recordStreamAddressSignal(address, value, reason, now = Date.now()) {
+  if (!address || !streamAddressSignalTtlMs || !Number.isFinite(value) || !value) {
+    return;
+  }
+
+  pruneExpiredStreamAddressSignals(now);
+  const currentSignals = streamAddressSignals.get(address) || [];
+  currentSignals.push({
+    at: now,
+    expiresAt: now + streamAddressSignalTtlMs,
+    value,
+    reason,
+  });
+  streamAddressSignals.set(address, currentSignals.slice(-20));
+}
+
+function getStreamAddressScore(address, now = Date.now()) {
+  pruneExpiredStreamAddressSignals(now);
+  const signals = streamAddressSignals.get(address) || [];
+  let score = 0;
+  let lastAt = 0;
+  for (const signal of signals) {
+    score += signal.value;
+    lastAt = Math.max(lastAt, signal.at);
+  }
+  return { score, lastAt };
+}
+
+function rankStreamAddresses(addresses, failedAddresses = new Set(), now = Date.now()) {
+  pruneRecentBadStreamAddresses(now);
+  pruneExpiredStreamAddressSignals(now);
+
+  const ranked = addresses.map((address, index) => {
+    const { score, lastAt } = getStreamAddressScore(address, now);
+    return {
+      address,
+      index,
+      score,
+      lastAt,
+      failed: failedAddresses.has(address),
+      recentlyBad: recentBadStreamAddresses.has(address),
+    };
+  });
+
+  ranked.sort((left, right) => {
+    if (left.failed !== right.failed) {
+      return left.failed ? 1 : -1;
+    }
+    if (left.recentlyBad !== right.recentlyBad) {
+      return left.recentlyBad ? 1 : -1;
+    }
+    if (left.score !== right.score) {
+      return right.score - left.score;
+    }
+    if (left.lastAt !== right.lastAt) {
+      return right.lastAt - left.lastAt;
+    }
+    return left.index - right.index;
+  });
+
+  return ranked;
+}
+
 function isRetryStoppedError(error) {
   return error instanceof RetryStoppedError || error?.code === "RETRY_STOPPED";
+}
+
+function isRetryBudgetExceededError(error) {
+  return error instanceof RetryBudgetExceededError || error?.code === "RETRY_BUDGET_EXCEEDED";
 }
 
 function requestStop(control, error = new RetryStoppedError()) {
@@ -90,6 +237,8 @@ function cloneStatusSnapshot(status) {
   return {
     ...status,
     events: [...status.events],
+    lastAttempt: status.lastAttempt ? JSON.parse(JSON.stringify(status.lastAttempt)) : null,
+    attemptDiagnostics: (status.attemptDiagnostics || []).map((entry) => JSON.parse(JSON.stringify(entry))),
   };
 }
 
@@ -124,6 +273,76 @@ function pushEvent(event) {
       syncCascadeStatuses();
     }
   }
+}
+
+function captureRelevantHeaders(headers) {
+  const captured = {};
+  for (const headerName of diagnosticHeaderNames) {
+    const headerValue = headers?.[headerName];
+    if (headerValue === undefined) {
+      continue;
+    }
+    captured[headerName] = Array.isArray(headerValue) ? headerValue.join(", ") : String(headerValue);
+  }
+  return captured;
+}
+
+function captureRelevantRequestHeaders(headers) {
+  const captured = {};
+  for (const headerName of diagnosticRequestHeaderNames) {
+    const headerValue = headers?.[headerName];
+    if (headerValue === undefined) {
+      continue;
+    }
+    captured[headerName] = Array.isArray(headerValue) ? headerValue.join(", ") : String(headerValue);
+  }
+  return captured;
+}
+
+function describeSocket(socket) {
+  if (!socket) {
+    return {};
+  }
+
+  return {
+    remoteAddress: socket.remoteAddress || "",
+    remotePort: socket.remotePort || 0,
+    remoteFamily: socket.remoteFamily || "",
+    localAddress: socket.localAddress || "",
+    localPort: socket.localPort || 0,
+    alpnProtocol: socket.alpnProtocol || "",
+    authorized: typeof socket.authorized === "boolean" ? socket.authorized : undefined,
+    servername: socket.servername || "",
+  };
+}
+
+function pushAttemptDiagnostic(requestInfo, diagnostic) {
+  runtimeStatus.lastAttempt = diagnostic;
+  runtimeStatus.attemptDiagnostics = [...runtimeStatus.attemptDiagnostics, diagnostic].slice(-attemptHistoryLimit);
+  runtimeStatus.updatedAt = Date.now();
+
+  if (requestInfo.cascadeId) {
+    const cascadeStatus = cascadeStatuses.get(requestInfo.cascadeId) || createStatusSnapshot(requestInfo.cascadeId);
+    cascadeStatus.lastAttempt = diagnostic;
+    cascadeStatus.attemptDiagnostics = [...(cascadeStatus.attemptDiagnostics || []), diagnostic].slice(-attemptHistoryLimit);
+    cascadeStatus.updatedAt = Date.now();
+    cascadeStatuses.set(requestInfo.cascadeId, cascadeStatus);
+    syncCascadeStatuses();
+  }
+
+  const payload = JSON.stringify({
+    recordedAt: new Date().toISOString(),
+    requestInfo: {
+      path: requestInfo.path,
+      model: requestInfo.model,
+      cascadeId: requestInfo.cascadeId,
+      requestHeaders: requestInfo.requestHeaders || {},
+    },
+    diagnostic,
+  });
+  fs.appendFile(attemptLogPath, `${payload}\n`, "utf8").catch((error) => {
+    log(`failed to append attempt diagnostic log_path=${attemptLogPath} error=${error.message}`);
+  });
 }
 
 function setCascadeStatus(cascadeId, next) {
@@ -353,12 +572,36 @@ function retryDelayMs(attempt, headers, bodyText) {
   return Math.min(baseDelayMs * Math.pow(2, Math.max(0, attempt - 1)), maxDelayMs);
 }
 
+function retryDelayMsForStreamRequest(requestInfo, attempt, headers, bodyText) {
+  if (!requestInfo.isStreamGenerateContent) {
+    return retryDelayMs(attempt, headers, bodyText);
+  }
+
+  const upstreamDelay = retryDelayMs(attempt, headers, bodyText);
+  if (attempt <= 2) {
+    return Math.min(upstreamDelay, 1000);
+  }
+  return upstreamDelay;
+}
+
 function isQuotaExhausted(statusCode, bodyText) {
   if (statusCode !== 429) {
     return false;
   }
 
   return /quota will reset after/i.test(bodyText) || /exhausted your capacity/i.test(bodyText);
+}
+
+function isCapacityRateLimited(statusCode, bodyText) {
+  return statusCode === 429 && !isQuotaExhausted(statusCode, bodyText);
+}
+
+function retryDelayMsForRetryableResponse(requestInfo, attempt, statusCode, headers, bodyText) {
+  if (isCapacityRateLimited(statusCode, bodyText)) {
+    return Math.max(retryDelayMs(attempt, headers, bodyText), streamCapacity429BackoffMs);
+  }
+
+  return retryDelayMsForStreamRequest(requestInfo, attempt, headers, bodyText);
 }
 
 function extractModelFromValue(value) {
@@ -469,6 +712,8 @@ function extractRequestInfo(req, body) {
     model: "",
     identifiers: {},
     cascadeId: "",
+    requestHeaders: captureRelevantRequestHeaders(req.headers),
+    isStreamGenerateContent: /\/v1internal:streamGenerateContent\b/i.test(req.url || ""),
   };
 
   if (!body || body.length === 0) {
@@ -552,11 +797,280 @@ function formatRequestContext(requestInfo) {
       .join(",");
     parts.push(` ids=${formattedIdentifiers}`);
   }
+  if (requestInfo.requestHeaders?.["x-goog-api-client"]) {
+    parts.push(` x_goog_api_client=${truncateForLog(requestInfo.requestHeaders["x-goog-api-client"])}`);
+  }
+  if (requestInfo.requestHeaders?.["x-client-data"]) {
+    parts.push(` x_client_data=${truncateForLog(requestInfo.requestHeaders["x-client-data"])}`);
+  }
+  if (requestInfo.requestHeaders?.traceparent) {
+    parts.push(` traceparent=${truncateForLog(requestInfo.requestHeaders.traceparent)}`);
+  }
   return parts.join("");
 }
 
-function singleForwardRequest(req, body, control) {
+function formatAttemptDiagnosticSummary(diagnostic) {
+  if (!diagnostic || typeof diagnostic !== "object") {
+    return "";
+  }
+
+  const parts = [];
+  if (diagnostic.statusCode) {
+    parts.push(`status=${diagnostic.statusCode}`);
+  }
+  if (diagnostic.outcome) {
+    parts.push(`outcome=${diagnostic.outcome}`);
+  }
+  if (diagnostic.upstream?.remoteAddress) {
+    const portSuffix = diagnostic.upstream.remotePort ? `:${diagnostic.upstream.remotePort}` : "";
+    parts.push(`upstream=${diagnostic.upstream.remoteAddress}${portSuffix}`);
+  }
+  if (diagnostic.upstream?.selectedAddress && diagnostic.upstream.selectedAddress !== diagnostic.upstream.remoteAddress) {
+    parts.push(`selected=${diagnostic.upstream.selectedAddress}`);
+  }
+  if (Number.isFinite(diagnostic.timings?.dnsLookupMs)) {
+    parts.push(`dns_ms=${diagnostic.timings.dnsLookupMs}`);
+  }
+  if (Number.isFinite(diagnostic.timings?.firstByteMs)) {
+    parts.push(`ttfb_ms=${diagnostic.timings.firstByteMs}`);
+  }
+  if (Number.isFinite(diagnostic.timings?.totalMs)) {
+    parts.push(`total_ms=${diagnostic.timings.totalMs}`);
+  }
+  if (diagnostic.responseHeaders?.["x-envoy-upstream-service-time"]) {
+    parts.push(`envoy_ms=${diagnostic.responseHeaders["x-envoy-upstream-service-time"]}`);
+  }
+  if (diagnostic.responseHeaders?.["retry-after"]) {
+    parts.push(`retry_after=${diagnostic.responseHeaders["retry-after"]}`);
+  }
+
+  return parts.length ? ` ${parts.join(" ")}` : "";
+}
+
+function buildFallbackAttemptDiagnostic(req, requestInfo, attempt, error, outcome = "network_error") {
+  const now = new Date().toISOString();
+  return {
+    attempt,
+    method: req.method,
+    path: requestInfo.path,
+    model: requestInfo.model,
+    cascadeId: requestInfo.cascadeId,
+    startedAt: now,
+    completedAt: now,
+    outcome,
+    statusCode: 0,
+    error: error?.message || "Unknown upstream error",
+    socketReused: false,
+    timings: {
+      totalMs: 0,
+    },
+    requestHeaders: requestInfo.requestHeaders || {},
+    upstream: {
+      host: targetHost,
+    },
+    responseHeaders: {},
+  };
+}
+
+function getRemainingStreamBudgetMs(control) {
+  if (!control?.deadlineAtMs) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return control.deadlineAtMs - Date.now();
+}
+
+function assertWithinRetryBudget(control) {
+  if (!control?.deadlineAtMs) {
+    return;
+  }
+
+  if (getRemainingStreamBudgetMs(control) > 0) {
+    return;
+  }
+
+  throw new RetryBudgetExceededError(`Stream retry budget exceeded after ${streamTotalBudgetMs}ms`);
+}
+
+function shouldAvoidStreamAddress(diagnostic) {
+  if (!diagnostic?.upstream?.remoteAddress) {
+    return false;
+  }
+
+  if (diagnostic.outcome === "attempt_timeout") {
+    return true;
+  }
+
+  if (diagnostic.statusCode >= 500) {
+    return true;
+  }
+
+  if (diagnostic.outcome?.includes("network")) {
+    return true;
+  }
+
+  return diagnostic.statusCode === 429;
+}
+
+function updateStreamAddressHealth(diagnostic) {
+  if (!diagnostic?.upstream?.remoteAddress || !/\/v1internal:streamGenerateContent\b/i.test(diagnostic.path || "")) {
+    return;
+  }
+
+  const address = diagnostic.upstream.remoteAddress;
+  const firstByteMs = diagnostic.timings?.firstByteMs;
+
+  if (diagnostic.outcome === "success") {
+    if (Number.isFinite(firstByteMs) && firstByteMs >= streamSlowSuccessMs) {
+      recordStreamAddressSignal(address, -1, "slow_success");
+      return;
+    }
+    recordStreamAddressSignal(address, 2, "success");
+    return;
+  }
+
+  if (diagnostic.outcome === "quota_exhausted") {
+    return;
+  }
+
+  if (diagnostic.outcome === "attempt_timeout") {
+    recordStreamAddressSignal(address, -4, "attempt_timeout");
+    return;
+  }
+
+  if (diagnostic.statusCode === 429) {
+    recordStreamAddressSignal(address, -2, "capacity_429");
+    return;
+  }
+
+  if (diagnostic.statusCode >= 500) {
+    recordStreamAddressSignal(address, -4, `http_${diagnostic.statusCode}`);
+    return;
+  }
+
+  if (diagnostic.outcome?.includes("network")) {
+    recordStreamAddressSignal(address, -4, "network_error");
+  }
+}
+
+async function resolveUpstreamTarget(requestInfo, control, attempt) {
+  if (!requestInfo.isStreamGenerateContent || !streamFreshConnectEnabled) {
+    return {
+      connectHostname: targetHost,
+      servername: targetHost,
+      resolvedAddresses: [],
+      selectedAddress: "",
+      selectedScore: 0,
+      agent: undefined,
+    };
+  }
+
+  const failedAddresses = control?.failedUpstreamAddresses || new Set();
+  const shouldFreshConnect = streamFreshConnectOnFirstAttempt || attempt > 1 || failedAddresses.size > 0;
+  if (!shouldFreshConnect) {
+    return {
+      connectHostname: targetHost,
+      servername: targetHost,
+      resolvedAddresses: [],
+      selectedAddress: "",
+      selectedScore: 0,
+      agent: undefined,
+    };
+  }
+
+  try {
+    const records = await dns.promises.lookup(targetHost, { all: true, family: 4 });
+    const uniqueAddresses = [...new Set(records.map((record) => record.address).filter(Boolean))];
+    if (!uniqueAddresses.length) {
+      return {
+        connectHostname: targetHost,
+        servername: targetHost,
+        resolvedAddresses: [],
+        selectedAddress: "",
+        selectedScore: 0,
+        agent: false,
+      };
+    }
+
+    const rankedAddresses = rankStreamAddresses(uniqueAddresses, failedAddresses);
+    const healthyAddresses = rankedAddresses.filter((entry) => !entry.failed && !entry.recentlyBad);
+    const fallbackAddresses = rankedAddresses.filter((entry) => !entry.failed);
+    const pool = (healthyAddresses.length ? healthyAddresses : fallbackAddresses.length ? fallbackAddresses : rankedAddresses);
+    const selected = pool[0];
+    const selectedAddress = selected?.address || uniqueAddresses[0];
+    return {
+      connectHostname: selectedAddress,
+      servername: targetHost,
+      resolvedAddresses: uniqueAddresses,
+      selectedAddress,
+      selectedScore: selected?.score || 0,
+      agent: false,
+    };
+  } catch (error) {
+    log(`dns lookup failed host=${targetHost} path=${requestInfo.path} error=${error.message}`);
+    return {
+      connectHostname: targetHost,
+      servername: targetHost,
+      resolvedAddresses: [],
+      selectedAddress: "",
+      selectedScore: 0,
+      agent: false,
+    };
+  }
+}
+
+async function singleForwardRequest(req, body, control, requestInfo, attempt) {
+  const upstreamTarget = await resolveUpstreamTarget(requestInfo, control, attempt);
   return new Promise((resolve, reject) => {
+    const startedAtMs = Date.now();
+    const attemptDiagnostic = {
+      attempt,
+      method: req.method,
+      path: requestInfo.path,
+      model: requestInfo.model,
+      cascadeId: requestInfo.cascadeId,
+      startedAt: new Date(startedAtMs).toISOString(),
+      completedAt: "",
+      outcome: "",
+      statusCode: 0,
+      error: "",
+      retryDelayMs: 0,
+      socketReused: false,
+      httpVersion: "",
+      bodyBytes: 0,
+      timings: {},
+      requestHeaders: requestInfo.requestHeaders || {},
+      upstream: {
+        host: targetHost,
+        selectedAddress: upstreamTarget.selectedAddress,
+        resolvedAddresses: upstreamTarget.resolvedAddresses,
+        selectedScore: upstreamTarget.selectedScore,
+      },
+      responseHeaders: {},
+    };
+
+    const finalizeAttemptDiagnostic = (updates = {}) => {
+      const completedAtMs = Date.now();
+      return {
+        ...attemptDiagnostic,
+        ...updates,
+        completedAt: updates.completedAt || new Date(completedAtMs).toISOString(),
+        timings: {
+          ...attemptDiagnostic.timings,
+          totalMs: completedAtMs - startedAtMs,
+          ...(updates.timings || {}),
+        },
+        upstream: {
+          ...attemptDiagnostic.upstream,
+          ...(updates.upstream || {}),
+        },
+        responseHeaders: {
+          ...attemptDiagnostic.responseHeaders,
+          ...(updates.responseHeaders || {}),
+        },
+      };
+    };
+
     const headers = { ...req.headers, host: targetHost };
     if (body.length > 0) {
       headers["content-length"] = String(body.length);
@@ -567,30 +1081,101 @@ function singleForwardRequest(req, body, control) {
     const upstreamReq = https.request(
       {
         protocol: "https:",
-        hostname: targetHost,
+        hostname: upstreamTarget.connectHostname,
         port: 443,
         method: req.method,
         path: req.url,
         headers,
+        servername: upstreamTarget.servername,
+        agent: upstreamTarget.agent,
       },
       (upstreamRes) => {
         if (control) {
           control.currentUpstreamReq = undefined;
           control.currentUpstreamRes = upstreamRes;
         }
-        resolve({ upstreamRes });
+        const responseSocket = upstreamRes.socket || upstreamReq.socket;
+        const responseHeaders = captureRelevantHeaders(upstreamRes.headers);
+        resolve({
+          upstreamRes,
+          attemptDiagnostic: finalizeAttemptDiagnostic({
+            statusCode: upstreamRes.statusCode || 0,
+            httpVersion: upstreamRes.httpVersion || "",
+            responseHeaders,
+            upstream: describeSocket(responseSocket),
+            timings: {
+              firstByteMs: Date.now() - startedAtMs,
+            },
+          }),
+        });
       },
     );
+
+    const attemptBudgetMs = requestInfo.isStreamGenerateContent ? getRemainingStreamBudgetMs(control) : Number.POSITIVE_INFINITY;
+    if (Number.isFinite(attemptBudgetMs) && attemptBudgetMs > 0) {
+      upstreamReq.setTimeout(attemptBudgetMs, () => {
+        const timeoutError = new Error(`Stream retry budget reached during attempt after ${attemptBudgetMs}ms`);
+        timeoutError.code = "STREAM_ATTEMPT_TIMEOUT";
+        timeoutError.attemptDiagnostic = finalizeAttemptDiagnostic({
+          outcome: "attempt_timeout",
+          error: timeoutError.message,
+          upstream: describeSocket(upstreamReq.socket),
+        });
+        upstreamReq.destroy(timeoutError);
+      });
+    }
 
     if (control) {
       control.currentUpstreamReq = upstreamReq;
     }
+
+    upstreamReq.on("socket", (socket) => {
+      attemptDiagnostic.socketReused = Boolean(upstreamReq.reusedSocket);
+      attemptDiagnostic.upstream = {
+        ...attemptDiagnostic.upstream,
+        ...describeSocket(socket),
+      };
+
+      socket.once("lookup", (error, address, family, host) => {
+        if (error) {
+          attemptDiagnostic.error = error.message;
+          return;
+        }
+        attemptDiagnostic.timings.dnsLookupMs = Date.now() - startedAtMs;
+        attemptDiagnostic.upstream.lookupAddress = address || "";
+        attemptDiagnostic.upstream.lookupFamily = family || 0;
+        attemptDiagnostic.upstream.lookupHost = host || "";
+      });
+
+      socket.once("connect", () => {
+        attemptDiagnostic.timings.tcpConnectMs = Date.now() - startedAtMs;
+        attemptDiagnostic.upstream = {
+          ...attemptDiagnostic.upstream,
+          ...describeSocket(socket),
+        };
+      });
+
+      socket.once("secureConnect", () => {
+        attemptDiagnostic.timings.tlsHandshakeMs = Date.now() - startedAtMs;
+        attemptDiagnostic.upstream = {
+          ...attemptDiagnostic.upstream,
+          ...describeSocket(socket),
+        };
+      });
+    });
 
     upstreamReq.on("error", (error) => {
       if (control) {
         control.currentUpstreamReq = undefined;
         control.currentUpstreamRes = undefined;
       }
+      error.attemptDiagnostic =
+        error.attemptDiagnostic ||
+        finalizeAttemptDiagnostic({
+          outcome: "network_error",
+          error: error.message,
+          upstream: describeSocket(upstreamReq.socket),
+        });
       reject(error);
     });
 
@@ -602,27 +1187,34 @@ function singleForwardRequest(req, body, control) {
 }
 
 async function forwardRequest(req, body, requestInfo) {
-  const control = requestInfo.cascadeId
-    ? {
-        requestInfo,
-        stopped: false,
-        stopListeners: new Set(),
-      }
-    : undefined;
+  const control = {
+    requestInfo,
+    stopped: false,
+    stopListeners: new Set(),
+    failedUpstreamAddresses: new Set(),
+    deadlineAtMs: requestInfo.isStreamGenerateContent && streamTotalBudgetMs > 0 ? Date.now() + streamTotalBudgetMs : 0,
+  };
 
-  if (control) {
+  if (requestInfo.cascadeId) {
     activeRequestControls.set(requestInfo.cascadeId, control);
   }
 
   try {
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
+        assertWithinRetryBudget(control);
         assertNotStopped(control);
-        const { upstreamRes } = await singleForwardRequest(req, body, control);
+        const { upstreamRes, attemptDiagnostic } = await singleForwardRequest(req, body, control, requestInfo, attempt);
         assertNotStopped(control);
 
         const statusCode = upstreamRes.statusCode || 0;
         if (!retryableStatuses.has(statusCode)) {
+          const successDiagnostic = {
+            ...attemptDiagnostic,
+            outcome: "success",
+          };
+          updateStreamAddressHealth(successDiagnostic);
+          pushAttemptDiagnostic(requestInfo, successDiagnostic);
           return { upstreamRes };
         }
 
@@ -634,18 +1226,56 @@ async function forwardRequest(req, body, requestInfo) {
         const bodyText = responseBody.toString("utf8");
 
         if (isQuotaExhausted(statusCode, bodyText)) {
+          const quotaDiagnostic = {
+            ...attemptDiagnostic,
+            outcome: "quota_exhausted",
+            bodyBytes: responseBody.length,
+          };
+          updateStreamAddressHealth(quotaDiagnostic);
+          pushAttemptDiagnostic(requestInfo, quotaDiagnostic);
           showQuotaExhausted(requestInfo);
-          log(`passthrough quota exhaustion status=${statusCode} attempt=${attempt}/${maxAttempts}${formatRequestContext(requestInfo)}`);
+          log(
+            `passthrough quota exhaustion status=${statusCode} attempt=${attempt}/${maxAttempts}${formatRequestContext(requestInfo)}${formatAttemptDiagnosticSummary(quotaDiagnostic)}`,
+          );
           return { upstreamRes, responseBody };
         }
 
         if (attempt >= maxAttempts) {
+          const exhaustedDiagnostic = {
+            ...attemptDiagnostic,
+            outcome: "retry_exhausted_status",
+            bodyBytes: responseBody.length,
+          };
+          updateStreamAddressHealth(exhaustedDiagnostic);
+          pushAttemptDiagnostic(requestInfo, exhaustedDiagnostic);
           return { upstreamRes, responseBody };
         }
 
-        const delay = retryDelayMs(attempt, upstreamRes.headers, bodyText);
+        const delay = retryDelayMsForRetryableResponse(requestInfo, attempt, statusCode, upstreamRes.headers, bodyText);
+        const diagnosticWithRetry = {
+          ...attemptDiagnostic,
+          outcome: "retry_scheduled",
+          retryDelayMs: delay,
+          bodyBytes: responseBody.length,
+        };
+        updateStreamAddressHealth(diagnosticWithRetry);
+        if (requestInfo.isStreamGenerateContent && shouldAvoidStreamAddress(diagnosticWithRetry)) {
+          control?.failedUpstreamAddresses.add(diagnosticWithRetry.upstream.remoteAddress);
+          markRecentBadStreamAddress(diagnosticWithRetry.upstream.remoteAddress);
+        }
+        pushAttemptDiagnostic(requestInfo, diagnosticWithRetry);
+        if (
+          requestInfo.isStreamGenerateContent &&
+          control?.deadlineAtMs &&
+          getRemainingStreamBudgetMs(control) <= Math.max(delay, streamMinRemainingBudgetMs)
+        ) {
+          log(`retry budget exhausted attempt=${attempt}/${maxAttempts}${formatRequestContext(requestInfo)}${formatAttemptDiagnosticSummary(diagnosticWithRetry)}`);
+          return { upstreamRes, responseBody };
+        }
         beginRetryStatus(requestInfo, attempt, statusCode, `HTTP ${statusCode}`);
-        log(`retryable upstream status=${statusCode} attempt=${attempt}/${maxAttempts} delay_ms=${delay}${formatRequestContext(requestInfo)}`);
+        log(
+          `retryable upstream status=${statusCode} attempt=${attempt}/${maxAttempts} delay_ms=${delay}${formatRequestContext(requestInfo)}${formatAttemptDiagnosticSummary(diagnosticWithRetry)}`,
+        );
         await waitForRetryDelay(requestInfo, control, attempt, delay);
       } catch (error) {
         if (isRetryStoppedError(error)) {
@@ -655,20 +1285,59 @@ async function forwardRequest(req, body, requestInfo) {
           throw error;
         }
 
+        if (isRetryBudgetExceededError(error)) {
+          pushAttemptDiagnostic(requestInfo, buildFallbackAttemptDiagnostic(req, requestInfo, attempt, error, "retry_budget_exhausted"));
+          throw error;
+        }
+
         if (attempt >= maxAttempts) {
+          const exhaustedDiagnostic =
+            error.attemptDiagnostic
+              ? {
+                  ...error.attemptDiagnostic,
+                  outcome: "retry_exhausted_network_error",
+                }
+              : buildFallbackAttemptDiagnostic(req, requestInfo, attempt, error, "retry_exhausted_network_error");
+          updateStreamAddressHealth(exhaustedDiagnostic);
+          pushAttemptDiagnostic(requestInfo, exhaustedDiagnostic);
           throw error;
         }
 
         const delay = Math.min(baseDelayMs * Math.pow(2, Math.max(0, attempt - 1)), maxDelayMs);
+        const adjustedDelay = requestInfo.isStreamGenerateContent ? Math.min(delay, attempt <= 2 ? 1000 : delay) : delay;
+        const diagnosticWithRetry =
+          error.attemptDiagnostic
+            ? {
+                ...error.attemptDiagnostic,
+                outcome: "network_retry_scheduled",
+                retryDelayMs: adjustedDelay,
+              }
+            : buildFallbackAttemptDiagnostic(req, requestInfo, attempt, error, "network_retry_scheduled");
+        updateStreamAddressHealth(diagnosticWithRetry);
+        if (requestInfo.isStreamGenerateContent && shouldAvoidStreamAddress(diagnosticWithRetry)) {
+          control?.failedUpstreamAddresses.add(diagnosticWithRetry.upstream.remoteAddress);
+          markRecentBadStreamAddress(diagnosticWithRetry.upstream.remoteAddress);
+        }
+        pushAttemptDiagnostic(requestInfo, diagnosticWithRetry);
+        if (
+          requestInfo.isStreamGenerateContent &&
+          control?.deadlineAtMs &&
+          getRemainingStreamBudgetMs(control) <= Math.max(adjustedDelay, streamMinRemainingBudgetMs)
+        ) {
+          log(`retry budget exhausted attempt=${attempt}/${maxAttempts}${formatRequestContext(requestInfo)}${formatAttemptDiagnosticSummary(diagnosticWithRetry)}`);
+          throw error;
+        }
         beginRetryStatus(requestInfo, attempt, 0, error.message);
-        log(`upstream error attempt=${attempt}/${maxAttempts} delay_ms=${delay}${formatRequestContext(requestInfo)} error=${error.message}`);
-        await waitForRetryDelay(requestInfo, control, attempt, delay);
+        log(
+          `upstream error attempt=${attempt}/${maxAttempts} delay_ms=${adjustedDelay}${formatRequestContext(requestInfo)} error=${error.message}${formatAttemptDiagnosticSummary(diagnosticWithRetry)}`,
+        );
+        await waitForRetryDelay(requestInfo, control, attempt, adjustedDelay);
       }
     }
 
     throw new Error("retry loop exited unexpectedly");
   } finally {
-    if (control && activeRequestControls.get(requestInfo.cascadeId) === control) {
+    if (requestInfo.cascadeId && activeRequestControls.get(requestInfo.cascadeId) === control) {
       activeRequestControls.delete(requestInfo.cascadeId);
     }
   }
@@ -792,6 +1461,15 @@ const server = http.createServer(async (req, res) => {
       if (!res.headersSent && !res.destroyed) {
         res.writeHead(499, { "content-type": "application/json", "cache-control": "no-store" });
         res.end(JSON.stringify({ error: "retry_stopped", message: error.message, cascadeId: requestInfo.cascadeId }));
+      }
+      return;
+    }
+
+    if (isRetryBudgetExceededError(error)) {
+      log(`retry budget exhausted${formatRequestContext(requestInfo)} error=${error.message}`);
+      if (!res.headersSent && !res.destroyed) {
+        res.writeHead(504, { "content-type": "application/json", "cache-control": "no-store" });
+        res.end(JSON.stringify({ error: "retry_budget_exhausted", message: error.message, cascadeId: requestInfo.cascadeId }));
       }
       return;
     }
