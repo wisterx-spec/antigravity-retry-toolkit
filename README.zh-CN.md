@@ -2,6 +2,8 @@
 
 [English README](README.md) | 中文
 
+用一个本地 proxy 和状态栏扩展，在 macOS 上处理 Antigravity 的 `429` / `503` 重试失败，并把过程清楚显示出来。
+
 这是一个面向 macOS 上 Antigravity 用户的小工具包。它的目标是：当大模型后端或网络入口出现短时失败时，自动重试，并把重试状态显示出来，而不是让用户只能反复手动点 retry。
 
 Antigravity Retry Toolkit 给 Antigravity 增加两类能力：
@@ -10,6 +12,27 @@ Antigravity Retry Toolkit 给 Antigravity 增加两类能力：
 - 在状态栏显示重试状态、最近错误和 quota 类失败。
 
 这个仓库已经按可以直接发布到 GitHub 的方式组织。
+
+## 适合谁
+
+- 你在 macOS 上使用 Antigravity
+- 你经常遇到 `429`、`503` 或短时连接失败
+- 你想让系统自动重试，而不是手动反复点 retry
+- 你希望在 Antigravity 里直接看到重试状态
+
+## 不适合谁
+
+- 不愿意修改 Antigravity 用户设置的用户
+- 需要托管服务而不是本地 proxy 的用户
+- 还没有验证过的 Windows 或 Linux 环境
+
+## 3 步快速上手
+
+1. 安装本地 retry proxy
+2. 把 `jetski.cloudCodeUrl` 指向 `http://127.0.0.1:38475`
+3. 在 Antigravity 中安装 `extension/retry-status-bar-0.2.24.vsix`
+
+如果你想看完整命令和截图，直接跳到 [快速开始](#快速开始)。
 
 ## 常见问题
 

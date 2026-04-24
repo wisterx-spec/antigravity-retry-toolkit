@@ -2,6 +2,8 @@
 
 English | [中文说明](README.zh-CN.md)
 
+Fix Antigravity `429` / `503` retry failures on macOS with a local proxy and a status bar extension that shows what is happening.
+
 A small macOS toolkit for Antigravity users who want transient model/backend failures to retry automatically and become visible instead of failing silently.
 
 Antigravity Retry Toolkit adds two capabilities to Antigravity:
@@ -10,6 +12,27 @@ Antigravity Retry Toolkit adds two capabilities to Antigravity:
 - a status bar extension that shows retry state, recent errors, and quota failures
 
 This repository is organized so it can be pushed to GitHub directly.
+
+## Who this is for
+
+- you use Antigravity on macOS
+- you repeatedly hit `429`, `503`, or transient connection failures
+- you want retries to happen automatically instead of clicking retry by hand
+- you want visible retry state inside Antigravity
+
+## Who this is not for
+
+- users who do not want to change Antigravity user settings
+- users who need a hosted service instead of a local proxy
+- Windows or Linux environments that have not been validated yet
+
+## Quick start in 3 steps
+
+1. Install the local retry proxy
+2. Point `jetski.cloudCodeUrl` to `http://127.0.0.1:38475`
+3. Install `extension/retry-status-bar-0.2.24.vsix` in Antigravity
+
+If you want the exact commands and screenshots, jump to [Quick start](#quick-start).
 
 ## Common failure symptoms
 
