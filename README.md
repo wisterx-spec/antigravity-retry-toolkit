@@ -219,7 +219,7 @@ Auto reload note:
 
 - From `0.2.14` onward, the running extension watches `~/.antigravity/extensions/extensions.json`
 - If it detects that the installed version of `wister-xue.retry-status-bar` changed, it will trigger `workbench.action.reloadWindow` automatically
-- This behavior has been verified locally for `0.2.16 -> 0.2.17`
+- This behavior was verified locally during the `v0.2.24` release prep.
 
 ## Configurable retry settings
 
