@@ -28,9 +28,9 @@ This repository is organized so it can be pushed to GitHub directly.
 
 ## Quick start in 3 steps
 
-1. Install the local retry proxy
-2. Point `jetski.cloudCodeUrl` to `http://127.0.0.1:38475`
-3. Install `extension/retry-status-bar-0.2.24.vsix` in Antigravity
+1. Run `./install.sh`
+2. Open Antigravity
+3. Reload the window if the status bar does not appear automatically
 
 If you want the exact commands and screenshots, jump to [Quick start](#quick-start).
 
@@ -134,14 +134,26 @@ Behavior:
 ### 1. Install the local retry proxy
 
 ```bash
-cd scripts
-chmod +x install-proxy.sh uninstall-proxy.sh
-./install-proxy.sh
+cd /Users/wister.xue/Desktop/workspace/antigravity-retry-toolkit
+chmod +x install.sh scripts/*.sh
+./install.sh
+```
+
+This one command:
+
+- installs the local retry proxy
+- points Antigravity `jetski.cloudCodeUrl` to `http://127.0.0.1:38475`
+- installs the newest packaged retry status bar VSIX
+
+If you want it to also try reloading open Antigravity windows automatically:
+
+```bash
+./install.sh --reload-windows
 ```
 
 ### 2. Point Antigravity at the local proxy
 
-Add this to Antigravity user settings:
+`./install.sh` already updates Antigravity user settings for you. The effective value is:
 
 ```json
 {
@@ -153,7 +165,9 @@ Add this to Antigravity user settings:
 
 ### 3. Install the status bar extension
 
-Inside Antigravity:
+`./install.sh` already installs the newest packaged VSIX into `~/.antigravity/extensions`.
+
+If you prefer the manual path inside Antigravity:
 
 1. Run `Extensions: Install from VSIX...`
 2. Choose `extension/retry-status-bar-0.2.24.vsix`
